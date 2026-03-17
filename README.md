@@ -2,18 +2,54 @@
 
 `TelegramRemoteControl`은 텔레그램에서 여러 로컬 프로젝트를 원격 제어하기 위한 공용 매니저입니다.
 
-핵심 목적은 두 가지입니다.
+원격에서 할 수 있는 핵심 일은 두 가지입니다.
 
 - 등록된 프로젝트의 운영 명령을 텔레그램에서 안전하게 실행
 - 등록된 프로젝트 경로에서 `codex exec`를 호출해 원격 수정 작업 시작
 
-즉, 앞으로 `auto_coin_bot` 말고 다른 프로젝트가 생겨도 이 저장소에 프로젝트만 추가 등록하면 같은 방식으로 제어할 수 있습니다.
+즉, `auto_coin_bot` 같은 기존 프로젝트뿐 아니라 앞으로 추가될 다른 로컬 프로젝트도 같은 방식으로 한 봇에서 관리할 수 있습니다.
+
+## 한눈에 보기
+
+- 텔레그램 명령으로 프로젝트 상태 확인
+- 등록된 시작/중지/점검 명령 실행
+- Codex 원격 작업 시작과 결과 확인
+- 맥북 상태 조회
+  - `/battery`
+  - `/wifi`
+  - `/disk`
+  - `/uptime`
+
+## 아키텍처
+
+```text
+Telegram
+  -> remote_manager.py
+     -> config/projects.toml 의 허용 프로젝트/명령 확인
+     -> 등록된 로컬 프로젝트 명령 실행
+     -> 필요하면 codex exec 작업 시작
+     -> logs/jobs/<job_id>/ 에 작업 결과 저장
+```
+
+## 현재 예시 프로젝트
+
+- `auto_coin_bot`
+  - 상태 확인
+  - 전체 시작/중지
+  - 텔레그램 리스너 시작/중지
+- `auto_stock_bot`
+  - KIS 연결 확인
+  - 현재가 조회 점검
+
+새 프로젝트를 붙일 때는 `config/projects.toml` 에 프로젝트 블록만 추가하면 됩니다.
 
 ## 구조
 
 - `remote_manager.py`: 텔레그램 폴링, 프로젝트 명령 실행, Codex 작업 시작
 - `config/projects.toml`: 관리 대상 프로젝트와 허용 명령 정의
 - `logs/jobs/<job_id>/`: Codex 작업 로그와 마지막 응답 저장
+- `scripts/run_remote_manager.sh`: 실행 보조 스크립트
+- `launchd/com.plo.remotebot.plist`: macOS launchd 예시 파일
 
 ## 보안 원칙
 
@@ -92,6 +128,17 @@ nohup python3 /Users/plo/Documents/remoteBot/remote_manager.py > /Users/plo/Docu
 /status auto_coin_bot
 /run auto_coin_bot start_all
 /codex auto_coin_bot README에 현재 봇 운영 구조를 반영해 정리해줘
+/job auto_coin_bot-20260314-170000
+```
+
+실무에서 자주 쓰는 흐름:
+
+```text
+/manager
+/projects
+/status auto_coin_bot
+/run auto_coin_bot start_all
+/codex auto_coin_bot 손절 로그를 더 자세히 남기도록 수정해줘
 /job auto_coin_bot-20260314-170000
 ```
 
