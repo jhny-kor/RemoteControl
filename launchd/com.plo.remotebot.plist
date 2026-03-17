@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.plo.remotebot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/plo/Documents/remoteBot/scripts/run_remote_manager.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/plo/Documents/remoteBot</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/plo/Documents/remoteBot/logs/launchd_remote_manager.out</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/plo/Documents/remoteBot/logs/launchd_remote_manager.err</string>
+</dict>
+</plist>

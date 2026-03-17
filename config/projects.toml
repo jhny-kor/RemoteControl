@@ -1,0 +1,42 @@
+[telegram]
+bot_token_env = "REMOTE_BOT_TELEGRAM_BOT_TOKEN"
+allowed_chat_ids = ["8672076449"]
+poll_interval_sec = 5
+offset_path = "logs/telegram_manager.offset"
+
+[manager]
+codex_bin = "/Applications/Codex.app/Contents/Resources/codex"
+jobs_dir = "logs/jobs"
+pid_path = "logs/remote_manager.pid"
+manager_log_path = "logs/remote_manager.out"
+
+[projects.auto_coin_bot]
+path = "/Users/plo/Documents/auto_coin_bot"
+description = "OKX/업비트 자동매매 프로젝트"
+
+[projects.auto_coin_bot.commands]
+status = ".venv/bin/python bot_manager.py status"
+start_all = ".venv/bin/python bot_manager.py start all"
+stop_all = ".venv/bin/python bot_manager.py stop"
+start_telegram = ".venv/bin/python bot_manager.py start telegram"
+stop_telegram = ".venv/bin/python bot_manager.py stop telegram"
+
+[projects.auto_coin_bot.codex]
+sandbox = "workspace-write"
+timeout_sec = 1200
+add_dirs = []
+skip_git_repo_check = false
+
+[projects.auto_stock_bot]
+path = "/Users/plo/Documents/auto_stock_bot"
+description = "한국투자증권 기반 자동주식 프로젝트"
+
+[projects.auto_stock_bot.commands]
+status = ".venv/bin/python scripts/kis_check_connection.py"
+quote_check = ".venv/bin/python scripts/kis_quote_check.py"
+
+[projects.auto_stock_bot.codex]
+sandbox = "workspace-write"
+timeout_sec = 1200
+add_dirs = []
+skip_git_repo_check = false
