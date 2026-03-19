@@ -32,6 +32,7 @@ import tomllib
 TELEGRAM_LIMIT = 4000
 APP_ROOT = Path(__file__).resolve().parent
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+HOSTNAME = os.uname().nodename
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,45 @@ def send_message(bot_token: str, chat_id: str, text: str) -> None:
             payload={"chat_id": chat_id, "text": chunk},
             timeout=30,
         )
+
+
+def send_broadcast_message(bot_token: str, chat_ids: set[str], text: str) -> None:
+    """허용된 모든 chat_id 로 같은 메시지를 전송한다."""
+    for chat_id in sorted(chat_ids):
+        send_message(bot_token, chat_id, text)
+
+
+def load_bot_token(config: AppConfig) -> str:
+    """환경 변수에서 텔레그램 봇 토큰을 읽는다."""
+    load_dotenv(APP_ROOT / ".env")
+    return os.getenv(config.telegram.bot_token_env, "").strip()
+
+
+def build_lifecycle_message(event: str, detail_lines: list[str] | None = None) -> str:
+    """매니저 라이프사이클 알림 메시지를 만든다."""
+    lines = [
+        f"remoteBot {event}",
+        f"host: {HOSTNAME}",
+        f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if detail_lines:
+        lines.extend(detail_lines)
+    return "\n".join(lines)
+
+
+def notify_manager_lifecycle(
+    config: AppConfig,
+    bot_token: str,
+    event: str,
+    detail_lines: list[str] | None = None,
+) -> None:
+    """매니저 시작/종료 알림을 텔레그램으로 전송한다."""
+    if not bot_token or not config.telegram.allowed_chat_ids:
+        return
+
+    text = build_lifecycle_message(event, detail_lines=detail_lines)
+    send_broadcast_message(bot_token, config.telegram.allowed_chat_ids, text)
+    append_manager_log(config, f"lifecycle notification sent: event={event}")
 
 
 def chunk_text(text: str, limit: int) -> list[str]:
@@ -1126,8 +1166,7 @@ def handle_command(
 
 def run_polling(config: AppConfig) -> None:
     """텔레그램 폴링 루프를 실행한다."""
-    load_dotenv(APP_ROOT / ".env")
-    bot_token = os.getenv(config.telegram.bot_token_env, "").strip()
+    bot_token = load_bot_token(config)
     if not bot_token:
         raise ValueError(
             f"텔레그램 봇 토큰이 없습니다. 환경 변수 {config.telegram.bot_token_env} 를 설정하세요."
@@ -1229,13 +1268,45 @@ def main() -> None:
         print(format_manager_status(config))
         return
 
+    bot_token = load_bot_token(config)
+    shutdown_reason = "normal_exit"
+
+    def handle_shutdown_signal(signum: int, _frame: Any) -> None:
+        nonlocal shutdown_reason
+        signal_name = signal.Signals(signum).name
+        shutdown_reason = signal_name
+        append_manager_log(config, f"shutdown signal received: {signal_name}")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+
     save_pid(config.manager.pid_path, os.getpid())
     try:
         run_polling(config)
+    except KeyboardInterrupt:
+        shutdown_reason = "KeyboardInterrupt"
+    except SystemExit:
+        raise
+    except Exception as exc:
+        shutdown_reason = f"error:{exc.__class__.__name__}"
+        raise
     finally:
         current_pid = load_pid(config.manager.pid_path)
         if current_pid == os.getpid():
             clear_pid(config.manager.pid_path)
+        try:
+            notify_manager_lifecycle(
+                config,
+                bot_token,
+                "shutdown",
+                detail_lines=[
+                    f"pid: {os.getpid()}",
+                    f"reason: {shutdown_reason}",
+                ],
+            )
+        except Exception as exc:
+            append_manager_log(config, f"lifecycle notification failed: event=shutdown error={exc}")
 
 
 if __name__ == "__main__":

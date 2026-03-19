@@ -250,6 +250,10 @@ python3 remote_manager.py --status
 - `logs/launchd_startup.out`
 - `logs/launchd_startup.err`
 
+부팅 시작 스크립트가 정상 실행되면 허용된 `allowed_chat_ids` 로 startup 메시지를 보냅니다.
+또 `remote_manager` 가 종료 신호를 받으면 shutdown 메시지를 보냅니다.
+전원 종료 시점 알림은 네트워크가 먼저 끊기면 전송이 실패할 수 있으므로 best effort 로 동작합니다.
+
 이미 각 프로젝트가 별도 `launchd` 로 자동 시작되고 있다면, 이 마스터 스크립트와 중복되지 않도록 기존 개별 자동 시작 `plist` 는 해제하는 편이 안전합니다.
 
 `plist` 안의 Python 경로, 작업 경로, 로그 경로는 자신의 환경에 맞게 확인하는 것이 안전합니다.

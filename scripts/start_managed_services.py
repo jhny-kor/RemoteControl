@@ -12,8 +12,16 @@ from typing import Any
 
 import tomllib
 
-
 APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from remote_manager import APP_ROOT as REMOTE_APP_ROOT
+from remote_manager import build_lifecycle_message
+from remote_manager import load_dotenv
+from remote_manager import send_message
+
+
 DEFAULT_CONFIG_PATH = APP_ROOT / "config" / "projects.toml"
 DEFAULT_LOG_PATH = APP_ROOT / "logs" / "start_managed_services.log"
 
@@ -54,6 +62,28 @@ def append_log(log_path: Path, message: str) -> None:
 
 def load_config(config_path: Path) -> dict[str, Any]:
     return tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+
+def notify_startup(
+    raw_config: dict[str, Any],
+    log_path: Path,
+    event: str,
+    detail_lines: list[str],
+) -> None:
+    telegram_raw = raw_config.get("telegram", {})
+    bot_token_env = str(telegram_raw.get("bot_token_env", "REMOTE_BOT_TELEGRAM_BOT_TOKEN"))
+    chat_ids = [str(chat_id) for chat_id in telegram_raw.get("allowed_chat_ids", [])]
+
+    load_dotenv(REMOTE_APP_ROOT / ".env")
+    bot_token = os.getenv(bot_token_env, "").strip()
+    if not bot_token or not chat_ids:
+        append_log(log_path, f"startup_notification_skipped | event={event}")
+        return
+
+    text = build_lifecycle_message(event, detail_lines=detail_lines)
+    for chat_id in sorted(set(chat_ids)):
+        send_message(bot_token, chat_id, text)
+    append_log(log_path, f"startup_notification_sent | event={event}")
 
 
 def collect_autostart_projects(raw_config: dict[str, Any]) -> list[AutostartProject]:
@@ -184,9 +214,29 @@ def main() -> int:
             start_project(project, log_path, args.dry_run)
     except Exception as exc:
         append_log(log_path, f"startup_failed | {exc}")
+        if not args.dry_run:
+            notify_startup(
+                raw_config,
+                log_path,
+                "startup failed",
+                detail_lines=[
+                    f"config: {config_path}",
+                    f"error: {exc}",
+                ],
+            )
         print(f"시작 실패: {exc}")
         return 1
 
+    if not args.dry_run:
+        notify_startup(
+            raw_config,
+            log_path,
+            "startup",
+            detail_lines=[
+                f"config: {config_path}",
+                f"projects: {', '.join(project.name for project in projects) or '-'}",
+            ],
+        )
     append_log(log_path, "=== boot startup end ===")
     print("관리 대상 시작 작업이 완료되었습니다.")
     return 0
