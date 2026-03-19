@@ -58,6 +58,8 @@ Telegram
 - `remote_manager.py`: 텔레그램 폴링, 프로젝트 명령 실행, Codex 작업 시작
 - `config/projects.toml`: 관리 대상 프로젝트와 허용 명령 정의
 - `logs/jobs/<job_id>/`: Codex 작업 로그와 마지막 응답 저장
+- `scripts/start_managed_services.py`: 부팅 시 `remote_manager`와 자동 시작 대상 프로젝트 실행
+- `scripts/run_start_managed_services.sh`: launchd 에서 호출하는 시작 래퍼
 - `scripts/run_remote_manager.sh`: 실행 보조 스크립트
 - `launchd/com.plo.remotebot.plist`: macOS launchd 예시 파일
 
@@ -191,6 +193,11 @@ description = "설명"
 status = "python3 app.py --status"
 restart = "./scripts/restart.sh"
 
+[projects.my_project.autostart]
+enabled = true
+command_key = "restart"
+delay_sec = 0
+
 [projects.my_project.codex]
 sandbox = "workspace-write"
 timeout_sec = 1200
@@ -200,11 +207,16 @@ skip_git_repo_check = false
 
 ## launchd 실행
 
-macOS에서 로그인 후 자동으로 `remote_manager`를 띄우고 싶다면 `launchd`를 사용할 수 있습니다.
+macOS에서 로그인 후 자동으로 `remote_manager`와 부팅 대상 프로젝트를 함께 띄우고 싶다면 `launchd`를 사용할 수 있습니다.
 
 기본 예시 파일:
 
 - `launchd/com.plo.remotebot.plist`
+
+이 `plist` 는 `scripts/run_start_managed_services.sh` 를 실행하고, 내부에서 아래 순서로 시작합니다.
+
+- `remote_manager.py --daemon`
+- `config/projects.toml` 에서 `autostart.enabled = true` 인 프로젝트의 `command_key`
 
 등록 예시:
 
@@ -223,6 +235,22 @@ launchctl list | grep remotebot
 launchctl stop com.plo.remotebot
 launchctl unload ~/Library/LaunchAgents/com.plo.remotebot.plist
 ```
+
+수동 점검:
+
+```bash
+python3 scripts/start_managed_services.py --dry-run
+python3 scripts/start_managed_services.py
+python3 remote_manager.py --status
+```
+
+로그:
+
+- `logs/start_managed_services.log`
+- `logs/launchd_startup.out`
+- `logs/launchd_startup.err`
+
+이미 각 프로젝트가 별도 `launchd` 로 자동 시작되고 있다면, 이 마스터 스크립트와 중복되지 않도록 기존 개별 자동 시작 `plist` 는 해제하는 편이 안전합니다.
 
 `plist` 안의 Python 경로, 작업 경로, 로그 경로는 자신의 환경에 맞게 확인하는 것이 안전합니다.
 

@@ -7,7 +7,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/plo/Documents/remoteBot/scripts/run_remote_manager.sh</string>
+    <string>/Users/plo/Documents/remoteBot/scripts/run_start_managed_services.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -17,15 +17,15 @@
   <true/>
 
   <key>KeepAlive</key>
-  <true/>
+  <false/>
 
   <key>ProcessType</key>
   <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/Users/plo/Documents/remoteBot/logs/launchd_remote_manager.out</string>
+  <string>/Users/plo/Documents/remoteBot/logs/launchd_startup.out</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/plo/Documents/remoteBot/logs/launchd_remote_manager.err</string>
+  <string>/Users/plo/Documents/remoteBot/logs/launchd_startup.err</string>
 </dict>
 </plist>
