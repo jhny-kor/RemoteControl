@@ -67,8 +67,14 @@ description = "Codex 자동화와 로컬 jobs를 실행하는 배치 매니저"
 [projects.batch_bot.managed_programs]
 "automation-2" = "오늘 공모주 텔레그램 전송"
 "automation-3" = "주간 공모주 텔레그램 전송"
-"daily-log-archive" = "auto_coin_bot 로그 압축 워크플로"
-"log-archive-retry" = "같은 날 로그 압축 실패 재시도"
+"daily-auto-coin-log-archive" = "auto_coin_bot 로그 압축 워크플로"
+"daily-swing-log-archive" = "auto_coin_bot_swing 로그 압축 워크플로"
+
+[projects.batch_bot.program_schedules]
+"automation-2" = "매일 06:00"
+"automation-3" = "매주 월 08:30"
+"daily-auto-coin-log-archive" = "매일 06:00"
+"daily-swing-log-archive" = "매일 06:05"
 
 [projects.batch_bot.commands]
 status = "python3 /Users/plo/Documents/remoteBot/scripts/batch_bot_summary.py"
