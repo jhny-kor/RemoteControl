@@ -4,12 +4,14 @@ import argparse
 import ast
 from contextlib import contextmanager
 import html
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
 APP_ROOT = Path("/Users/plo/Documents/remoteBot")
@@ -36,6 +38,7 @@ SERVER_LOG_PATH = APP_ROOT / "logs/process_control_server.log"
 OUT_PATH = APP_ROOT / "logs/process_control_server.out"
 ACCESS_KEY_PATH = APP_ROOT / "logs/process_control_access_key.txt"
 ACCESS_COOKIE_NAME = "remotebot_access"
+TOOL_RUN_LOG_DIR = APP_ROOT / "logs" / "tool_runs"
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 MAX_LOG_LINES = 120
 BACKTEST_SUMMARY_FILENAMES = {"batch_summary.md", "diff_summary.md"}
@@ -71,9 +74,15 @@ class RegimeEntry:
     exchange: str
     symbol: str
     regime: str
+    stage_text: str
+    meaning: str
+    reason: str
     volume_ratio: str
+    avg_abs_change_pct: str
     gap_pct: str
     rsi: str
+    adx: str
+    recorded_at_local: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,18 @@ class ServiceSpec:
     start_command: CommandSpec
     stop_command: CommandSpec
     expected_running_sections: int
+
+
+REGIME_STAGE_SEQUENCE: tuple[str, ...] = (
+    "LOW_ENERGY",
+    "CHOPPY_LOW_VOL",
+    "CHOPPY_HIGH_VOL",
+    "BREAKOUT_ATTEMPT",
+    "TRENDING_EARLY",
+    "TRENDING_MATURE",
+    "EXHAUSTION_RISK",
+    "OVERHEATED",
+)
 
 
 SERVICES = [
@@ -212,6 +233,7 @@ PROGRAM_TITLES: dict[str, dict[str, str]] = {
         "automation-2": "오늘의 공모주",
         "automation-3": "금주의 공모주",
         "daily-auto-coin-log-archive": "Coin Short Log Manager",
+        "daily-auto-stock-log-archive": "Stock Log Archive",
         "daily-swing-log-archive": "Coin Long Log Manager",
     },
 }
@@ -262,9 +284,34 @@ def build_swing_titles() -> dict[str, str]:
     return titles
 
 
+def load_auto_coin_titles() -> dict[str, str]:
+    registry_path = AUTO_COIN_ROOT / "core" / "runtime" / "program_registry.py"
+    try:
+        spec = importlib.util.spec_from_file_location("auto_coin_program_registry", registry_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("spec load failed")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        titles = getattr(module, "PROGRAM_TITLES", {})
+        if isinstance(titles, dict):
+            return {str(key): str(value) for key, value in titles.items()}
+    except Exception:
+        pass
+
+    return {
+        "okx": "OKX 봇",
+        "upbit": "업비트 봇",
+        "okx_btc": "OKX BTC EMA 봇",
+        "upbit_btc": "업비트 BTC EMA 봇",
+        "collector": "분석 수집기",
+        "upbit_stream": "업비트 웹소켓 수집기",
+        "telegram": "텔레그램 명령 리스너",
+    }
+
+
 PROGRAM_TITLES.update(
     {
-        "auto_coin_bot": load_literal_dict(AUTO_COIN_ROOT / "bot_manager.py", "SECTION_TITLES"),
+        "auto_coin_bot": load_auto_coin_titles(),
         "auto_coin_bot_swing": build_swing_titles(),
         "auto_stock_bot": load_literal_dict(AUTO_STOCK_ROOT / "bot_manager.py", "SECTION_TITLES"),
     }
@@ -548,6 +595,97 @@ def find_latest_backtest_summary() -> Path | None:
     return summaries[0] if summaries else None
 
 
+def find_latest_batch_summary_md() -> Path | None:
+    """주간/스냅샷 배치의 batch_summary.md 중 가장 최근 파일을 찾는다."""
+    if not AUTO_COIN_BACKTEST_ROOT.exists():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for path in AUTO_COIN_BACKTEST_ROOT.rglob("batch_summary.md"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        candidates.append((stat.st_mtime_ns, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def list_pending_backtest_batches(limit: int | None = None) -> list[tuple[Path, str, int]]:
+    """요약 Markdown 이 아직 없는 최근 배치 디렉터리를 반환한다."""
+    if not AUTO_COIN_BACKTEST_ROOT.exists():
+        return []
+
+    now = datetime.now().timestamp()
+    rows: list[tuple[int, Path, str, int]] = []
+    for child in AUTO_COIN_BACKTEST_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        has_summary = any(
+            path.is_file() and path.name in BACKTEST_SUMMARY_FILENAMES
+            for path in child.rglob("*.md")
+        )
+        if has_summary:
+            continue
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        results_dir = child / "results"
+        result_count = sum(1 for path in results_dir.iterdir() if path.is_dir()) if results_dir.exists() else 0
+        age_seconds = max(0, int(now - stat.st_mtime))
+        state = "진행 중" if age_seconds < 1800 else "확인 필요"
+        rows.append((stat.st_mtime_ns, child, state, result_count))
+
+    rows.sort(key=lambda item: item[0], reverse=True)
+    ordered = [(path, state, result_count) for _, path, state, result_count in rows]
+    if limit is not None:
+        return ordered[:limit]
+    return ordered
+
+
+def resolve_backtest_batch_dir(relative_path: str) -> Path | None:
+    """쿼리 문자열에서 받은 상대 경로를 안전하게 실제 배치 디렉터리로 해석한다."""
+    candidate = relative_path.strip()
+    if not candidate:
+        return None
+    try:
+        resolved = (AUTO_COIN_ROOT / candidate).resolve()
+    except OSError:
+        return None
+    try:
+        resolved.relative_to(AUTO_COIN_BACKTEST_ROOT)
+    except ValueError:
+        return None
+    if not resolved.is_dir():
+        return None
+    return resolved
+
+
+def delete_pending_backtest_batch(relative_path: str) -> str:
+    """요약 파일이 없는 확인 필요 배치를 삭제한다."""
+    batch_dir = resolve_backtest_batch_dir(relative_path)
+    if batch_dir is None:
+        return "삭제 대상 배치를 찾지 못했습니다."
+
+    has_summary = any(
+        path.is_file() and path.name in BACKTEST_SUMMARY_FILENAMES
+        for path in batch_dir.rglob("*.md")
+    )
+    if has_summary:
+        return "요약 파일이 이미 생성된 배치는 삭제할 수 없습니다."
+
+    try:
+        shutil.rmtree(batch_dir)
+    except OSError as exc:
+        append_server_log(f"백테스트 배치 삭제 실패: path={batch_dir} error={exc}")
+        return f"배치 삭제에 실패했습니다: {exc}"
+
+    append_server_log(f"백테스트 배치 삭제 완료: path={batch_dir}")
+    return f"{batch_dir.name} 배치를 삭제했습니다."
+
+
 def resolve_backtest_summary(relative_path: str) -> Path | None:
     """쿼리 문자열에서 받은 상대 경로를 안전하게 실제 파일로 해석한다."""
     candidate = relative_path.strip()
@@ -573,17 +711,26 @@ def build_backtest_summary_href(summary_path: Path, *, download: bool = False) -
     return f"{base}?path={quote(relative_path, safe='/')}"
 
 
-def render_backtest_summary_page(summary_path: Path) -> bytes:
-    """최근 백테스트 요약 전문 페이지를 렌더링한다."""
+def render_backtest_summary_page(
+    summary_path: Path, *, show_completed_banner: bool = False
+) -> bytes:
+    """백테스트 요약 Markdown 전문 페이지를 렌더링한다."""
     text = summary_path.read_text(encoding="utf-8")
     relative_path = summary_path.relative_to(AUTO_COIN_ROOT)
+    completed_block = ""
+    if show_completed_banner:
+        completed_block = """
+    <div class="done-banner" role="status">
+      웹에서 실행한 주간 백테스트가 완료되었습니다. 아래 요약이 방금 생성된 결과입니다.
+    </div>
+"""
     page = f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#1f7a49">
-  <title>최근 백테스트 요약</title>
+  <title>백테스트 요약</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
@@ -612,6 +759,17 @@ def render_backtest_summary_page(summary_path: Path) -> bytes:
       border-radius: 20px;
       padding: 22px;
       box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+    }}
+    .done-banner {{
+      margin: 0 0 16px;
+      padding: 12px 16px;
+      border-radius: 14px;
+      background: #e8f5ec;
+      border: 1px solid #b8dcc4;
+      color: #134d2a;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.5;
     }}
     h1 {{
       margin: 0;
@@ -664,7 +822,8 @@ def render_backtest_summary_page(summary_path: Path) -> bytes:
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>최근 백테스트 요약</h1>
+{completed_block}
+      <h1>백테스트 요약</h1>
       <p class="meta">{html.escape(str(relative_path))}</p>
       <div class="actions">
         <a class="ghost" href="/">메인으로</a>
@@ -682,6 +841,43 @@ def render_backtest_summary_page(summary_path: Path) -> bytes:
 
 def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
     """백테스트 요약 목록 페이지를 렌더링한다."""
+    pending_batches = list_pending_backtest_batches(limit=10)
+    pending_html = ""
+    if pending_batches:
+        pending_items = []
+        for path, state, result_count in pending_batches:
+            relative_path = path.relative_to(AUTO_COIN_ROOT).as_posix()
+            delete_form = ""
+            if state == "확인 필요":
+                delete_form = f"""
+                <form method="post" action="/delete-backtest-batch">
+                  <input type="hidden" name="batch_path" value="{html.escape(relative_path)}">
+                  <button type="submit" class="danger">삭제</button>
+                </form>
+                """
+            pending_items.append(
+                f"""
+                <li class="summary-row pending-row">
+                  <div class="summary-copy">
+                    <strong>{html.escape(path.name)}</strong>
+                    <span>{html.escape(relative_path)}</span>
+                  </div>
+                  <div class="summary-actions pending-actions">
+                    <span class="pending-badge">{html.escape(state)}</span>
+                    <span class="pending-note">생성된 결과 디렉터리 {result_count}개</span>
+                    {delete_form}
+                  </div>
+                </li>
+                """
+            )
+        pending_html = (
+            '<section class="pending-section">'
+            '<h2>진행 중 또는 요약 미생성 배치</h2>'
+            '<p class="meta">batch_summary.md 또는 diff_summary.md 가 아직 생성되지 않은 최근 실행입니다.</p>'
+            f'<ul class="summary-list">{"".join(pending_items)}</ul>'
+            '</section>'
+        )
+
     if summary_paths:
         items = []
         for path in summary_paths:
@@ -757,6 +953,16 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       display: grid;
       gap: 10px;
     }}
+    .pending-section {{
+      margin-bottom: 22px;
+      display: grid;
+      gap: 10px;
+    }}
+    h2 {{
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: -0.02em;
+    }}
     .summary-row {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -786,6 +992,29 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       flex-wrap: wrap;
       justify-content: flex-end;
     }}
+    .pending-row {{
+      background: #f3eadf;
+    }}
+    .pending-actions {{
+      align-items: flex-end;
+      flex-direction: column;
+    }}
+    .pending-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 78px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: #efe4b7;
+      color: #7a5d00;
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .pending-note {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
     a {{
       border-radius: 12px;
       padding: 10px 14px;
@@ -803,6 +1032,16 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
     .ghost {{
       background: #e6dccf;
       color: #2f2a25;
+    }}
+    .danger {{
+      border: 0;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      background: #a33b3b;
+      color: white;
+      cursor: pointer;
     }}
     .top-actions {{
       display: flex;
@@ -833,6 +1072,7 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       <div class="top-actions">
         <a class="ghost" href="/">메인으로</a>
       </div>
+      {pending_html}
       {list_html}
     </div>
   </div>
@@ -876,6 +1116,8 @@ def parse_service_state(service: ServiceSpec, output: str) -> str:
     if service.key == "batch_bot":
         if "state = running" in clean:
             return "running"
+        if "state = spawn scheduled" in clean or "state = waiting" in clean:
+            return "idle"
         if "LaunchAgent is not currently loaded" in clean:
             return "stopped"
         if "state =" in clean:
@@ -951,6 +1193,8 @@ def summarize_batch_manager(output: str) -> str:
         return "LaunchAgent 미적재 상태"
     if state == "running":
         return "배치 매니저가 실행 중입니다."
+    if state in {"spawn scheduled", "waiting"}:
+        return "배치 매니저가 다음 실행을 대기 중입니다."
     if state != "-":
         return f"배치 매니저 상태: {state}"
     return "배치 매니저 상태 확인이 필요합니다."
@@ -1273,7 +1517,9 @@ def load_short_regime_entries() -> list[RegimeEntry]:
         cwd=AUTO_COIN_ROOT,
         argv=[
             str(AUTO_COIN_ROOT / ".venv/bin/python"),
-            "current_regime_snapshot.py",
+            "-m",
+            "reporting.current_regime_snapshot",
+            "--print-only",
         ],
     )
     success, output = run_command(command)
@@ -1281,10 +1527,11 @@ def load_short_regime_entries() -> list[RegimeEntry]:
         append_server_log(f"단타 레짐 스냅샷 실행 실패: {output[:300]}")
         return []
     try:
-        rows = json.loads(output)
+        payload = json.loads(output)
     except json.JSONDecodeError as exc:
         append_server_log(f"단타 레짐 스냅샷 파싱 실패: {exc}")
         return []
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
 
     def sort_key(item: RegimeEntry) -> tuple[int, int, str]:
         exchange_order = 0 if item.exchange == "UPBIT" else 1
@@ -1299,24 +1546,294 @@ def load_short_regime_entries() -> list[RegimeEntry]:
         if not exchange or not symbol or not regime:
             continue
         volume_value = row.get("volume_ratio")
+        change_value = row.get("avg_abs_change_pct")
         gap_value = row.get("gap_pct")
         rsi_value = row.get("rsi")
+        adx_value = row.get("adx")
         volume_ratio = "-" if volume_value is None else f"{float(volume_value):.2f}배"
+        avg_abs_change_pct = "-" if change_value is None else f"{float(change_value):.3f}%"
         gap_pct = "-" if gap_value is None else f"{float(gap_value):.3f}%"
         rsi_text = "-" if rsi_value is None else f"{float(rsi_value):.1f}"
+        adx_text = "-" if adx_value is None else f"{float(adx_value):.1f}"
+        stage_index = row.get("stage_index")
+        total_stages = row.get("total_stages")
+        stage_text = (
+            f"{stage_index}/{total_stages}"
+            if stage_index not in (None, "")
+            else f"?/{total_stages or '-'}"
+        )
         entries.append(
             RegimeEntry(
                 exchange=exchange,
                 symbol=symbol,
                 regime=regime,
+                stage_text=stage_text,
+                meaning=str(row.get("meaning", "")).strip() or "-",
+                reason=str(row.get("reason", "")).strip() or "-",
                 volume_ratio=volume_ratio,
+                avg_abs_change_pct=avg_abs_change_pct,
                 gap_pct=gap_pct,
                 rsi=rsi_text,
+                adx=adx_text,
+                recorded_at_local=str(row.get("recorded_at_local", "")).strip() or None,
             )
         )
 
     entries.sort(key=sort_key)
     return entries
+
+
+def regime_badge_class(regime: str) -> str:
+    mapping = {
+        "LOW_ENERGY": "regime-low-energy",
+        "CHOPPY_LOW_VOL": "regime-choppy-low",
+        "CHOPPY_HIGH_VOL": "regime-choppy-high",
+        "BREAKOUT_ATTEMPT": "regime-breakout",
+        "TRENDING_EARLY": "regime-trending-early",
+        "TRENDING_MATURE": "regime-trending-mature",
+        "EXHAUSTION_RISK": "regime-exhaustion",
+        "OVERHEATED": "regime-overheated",
+    }
+    return mapping.get(regime, "regime-unknown")
+
+
+def display_regime_name(regime: str) -> str:
+    return regime.replace("_", " ")
+
+
+def render_regime_stage_overview(
+    entries: list[RegimeEntry],
+    *,
+    show_coins: bool = True,
+    layout: str = "flow",
+    size: str = "normal",
+) -> str:
+    grouped: dict[str, list[RegimeEntry]] = {regime: [] for regime in REGIME_STAGE_SEQUENCE}
+    for entry in entries:
+        grouped.setdefault(entry.regime, []).append(entry)
+
+    blocks: list[str] = []
+    for regime in REGIME_STAGE_SEQUENCE:
+        stage_entries = grouped.get(regime, [])
+        if stage_entries:
+            exchange_groups: dict[str, list[str]] = {}
+            for entry in stage_entries:
+                exchange_groups.setdefault(entry.exchange, []).append(entry.symbol)
+            group_lines = []
+            for exchange in sorted(exchange_groups):
+                group_lines.append(
+                    f"{html.escape(exchange)}: {html.escape(', '.join(exchange_groups[exchange]))}"
+                )
+            coins_html = "<br>".join(group_lines)
+        else:
+            coins_html = "없음"
+        blocks.append(
+            f"""
+            <div class="regime-stage {regime_badge_class(regime)}">
+              <div class="regime-stage-head">
+                <span class="regime-stage-name">{html.escape(display_regime_name(regime))}</span>
+              </div>
+              {f'<div class="regime-stage-coins">{coins_html}</div>' if show_coins else ''}
+            </div>
+            """
+        )
+
+    flow_items: list[str] = []
+    for idx, block in enumerate(blocks):
+        flow_items.append(block)
+        if idx < len(blocks) - 1:
+            flow_items.append('<div class="regime-arrow">→</div>')
+    board_classes = "regime-board regime-board-flow"
+    if size == "compact":
+        board_classes += " regime-board-compact"
+    return f'<div class="{board_classes}"><div class="regime-flow regime-flow-horizontal">{"".join(flow_items)}</div></div>'
+
+
+def render_short_regime_page(entries: list[RegimeEntry]) -> bytes:
+    """심볼별 현재 레짐 상세 페이지를 렌더링한다."""
+    if not entries:
+        body_rows = """
+        <tr>
+          <td colspan="9">표시할 현재 레짐 데이터가 없습니다.</td>
+        </tr>
+        """
+    else:
+        rows: list[str] = []
+        for entry in entries:
+            rows.append(
+                f"""
+                <tr>
+                  <td class="col-exchange">{html.escape(entry.exchange)}</td>
+                  <td class="col-symbol">{html.escape(entry.symbol)}</td>
+                  <td class="col-stage">{html.escape(entry.stage_text)}</td>
+                  <td class="col-regime"><span class="regime-badge {regime_badge_class(entry.regime)}">{html.escape(display_regime_name(entry.regime))}</span></td>
+                  <td class="col-meaning">{html.escape(entry.meaning)}</td>
+                  <td class="col-reason">{html.escape(entry.reason)}</td>
+                  <td class="col-volume">{html.escape(entry.volume_ratio)}</td>
+                  <td class="col-change">{html.escape(entry.avg_abs_change_pct)}</td>
+                  <td class="col-gap">{html.escape(entry.gap_pct)}</td>
+                  <td class="col-rsi">{html.escape(entry.rsi)}</td>
+                  <td class="col-adx">{html.escape(entry.adx)}</td>
+                </tr>
+                """
+            )
+        body_rows = "".join(rows)
+
+    page = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1f7a49">
+  <title>현재 레짐 상세</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {{
+      --bg: #efe7dc;
+      --card: #fbf8f3;
+      --text: #1f1a17;
+      --muted: #625b53;
+      --line: #ddd2c2;
+      --green: #1f7a49;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+      background: radial-gradient(circle at top left, #f5eee5 0%, var(--bg) 45%, #eadfcf 100%);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }}
+    .card {{
+      background: var(--card);
+      border-radius: 20px;
+      padding: 22px;
+      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: -0.03em;
+    }}
+    .meta {{
+      margin: 8px 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }}
+    .actions {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }}
+    a {{
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .ghost {{
+      background: #e6dccf;
+      color: #2f2a25;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      background: #f7f0e6;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      padding: 12px 10px;
+      vertical-align: top;
+      text-align: left;
+      line-height: 1.55;
+    }}
+    th {{
+      background: #efe4d5;
+      font-size: 13px;
+    }}
+    .regime-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    .regime-low-energy {{ background: #dfe7f1; color: #35506e; }}
+    .regime-choppy-low {{ background: #efe4b7; color: #7a5d00; }}
+    .regime-choppy-high {{ background: #f6dbb9; color: #8b5700; }}
+    .regime-breakout {{ background: #d6f1db; color: #1f7a49; }}
+    .regime-trending-early {{ background: #d8f0ea; color: #156c60; }}
+    .regime-trending-mature {{ background: #cfe3fb; color: #1e4f8f; }}
+    .regime-exhaustion {{ background: #f5dfc1; color: #8d5600; }}
+    .regime-overheated {{ background: #f1d9d9; color: #9f2f2f; }}
+    .regime-unknown {{ background: #e6dccf; color: #2f2a25; }}
+    .col-reason {{
+      max-width: 240px;
+      width: 240px;
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .col-volume {{
+      min-width: 78px;
+      white-space: nowrap;
+    }}
+    .col-meaning {{
+      min-width: 170px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>현재 레짐 상세</h1>
+      <p class="meta">각 심볼이 총 8단계 레짐 중 현재 어디에 있는지, 그리고 그 레짐이 실제로 어떤 시장 상황을 의미하는지 함께 보여줍니다.</p>
+      <div class="actions">
+        <a class="ghost" href="/">메인으로</a>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>거래소</th>
+            <th>심볼</th>
+            <th>단계</th>
+            <th>현재 레짐</th>
+            <th>레짐 의미</th>
+            <th>현재 해석</th>
+            <th>거래량</th>
+            <th>변화율</th>
+            <th>이격도</th>
+            <th>RSI</th>
+            <th>ADX</th>
+          </tr>
+        </thead>
+        <tbody>
+          {body_rows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
 
 
 def apply_desired_state(turn_on: bool) -> str:
@@ -1398,11 +1915,34 @@ def run_batch_program(program_key: str) -> str:
     return f"{service.title} / {title} 수동 실행을 요청했습니다.{suffix}"
 
 
-def run_tool_action(service_key: str, tool_key: str) -> str:
+def run_tool_action(service_key: str, tool_key: str) -> tuple[str, str | None]:
+    """도구를 실행하고 (플래시 메시지, 성공 시 이동할 상대 URL)을 반환한다."""
     service = find_service(service_key)
     tool = find_tool_action(service_key, tool_key)
     if service is None or tool is None:
-        return "알 수 없는 도구입니다."
+        return "알 수 없는 도구입니다.", None
+
+    if service_key == "auto_coin_bot" and tool_key == "weekly_backtest_report":
+        TOOL_RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = TOOL_RUN_LOG_DIR / f"{tool_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with log_path.open("a", encoding="utf-8") as log_stream:
+            process = subprocess.Popen(
+                tool.command.argv,
+                cwd=tool.command.cwd,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                text=True,
+            )
+        append_server_log(
+            f"{service.title} 도구 실행 | tool={tool_key} | 백그라운드 시작 | pid={process.pid} | log={log_path}"
+        )
+        message = (
+            f"{service.title} / {tool.label} 실행을 시작했습니다.\n"
+            "백테스트 요약 목록에서 진행 중 배치와 완료 결과를 확인할 수 있습니다."
+        )
+        return message, "/backtest-summaries"
 
     is_auto_stock_tool = service_key == "auto_stock_bot"
     if is_auto_stock_tool:
@@ -1441,7 +1981,33 @@ def run_tool_action(service_key: str, tool_key: str) -> str:
                 send_autostock_tool_documents(tool.label, changed_reports)
 
     suffix = "" if success else " 확인이 필요합니다."
-    return f"{service.title} / {tool.label} 실행을 요청했습니다.{suffix}"
+    message = f"{service.title} / {tool.label} 실행을 요청했습니다.{suffix}"
+
+    redirect_to: str | None = None
+    if service_key == "auto_coin_bot" and tool_key == "weekly_backtest_report":
+        latest = find_latest_batch_summary_md()
+        if success and latest is not None:
+            rel = latest.relative_to(AUTO_COIN_ROOT).as_posix()
+            redirect_to = (
+                "/backtest-summary?"
+                + urlencode({"path": rel, "completed": "1"})
+            )
+            message = (
+                f"{service.title} / {tool.label} 가 완료되었습니다. "
+                "아래에서 방금 생성된 요약을 확인할 수 있습니다."
+            )
+        else:
+            redirect_to = "/backtest-summaries"
+            preview = "\n".join(line.strip() for line in output.splitlines()[-5:]).strip()
+            if preview:
+                message = (
+                    f"{service.title} / {tool.label} 실행이 실패했습니다.\n"
+                    f"요약:\n{preview}"
+                )
+            else:
+                message = f"{service.title} / {tool.label} 실행이 실패했습니다."
+
+    return message, redirect_to
 
 
 def read_pid() -> int | None:
@@ -1524,7 +2090,7 @@ def render_page(message: str = "") -> bytes:
     def iter_program_sections(item: ServiceStatus) -> list[tuple[str | None, list[ProgramStatus]]]:
         if item.key == "auto_coin_bot":
             order = [
-                ("업비트", ["upbit_btc", "upbit"]),
+                ("업비트", ["upbit_btc", "upbit", "upbit_stream"]),
                 ("OKX", ["okx_btc", "okx"]),
                 ("관리", ["collector", "telegram"]),
             ]
@@ -1534,12 +2100,20 @@ def render_page(message: str = "") -> bytes:
                 if program.target_key is not None
             }
             sections: list[tuple[str | None, list[ProgramStatus]]] = []
+            consumed_keys: set[str] = set()
             for title, keys in order:
                 section_programs = [by_key[key] for key in keys if key in by_key]
                 if section_programs:
                     sections.append((title, section_programs))
+                    consumed_keys.update(
+                        key for key in keys if key in by_key
+                    )
 
-            extras = [program for program in item.programs if program.target_key is None]
+            extras = [
+                program
+                for program in item.programs
+                if program.target_key is None or program.target_key not in consumed_keys
+            ]
             if extras:
                 sections.append((None, extras))
             return sections
@@ -1573,6 +2147,7 @@ def render_page(message: str = "") -> bytes:
                 "upbit_btc": "비트코인",
                 "okx_btc": "비트코인",
                 "upbit": "알트",
+                "upbit_stream": "웹소켓 수집기",
                 "okx": "알트",
                 "collector": "분석 수집기",
                 "telegram": "텔레그램 명령 리스너",
@@ -1584,6 +2159,7 @@ def render_page(message: str = "") -> bytes:
                 "automation-2": "오늘의 공모주",
                 "automation-3": "금주의 공모주",
                 "daily-auto-coin-log-archive": "Coin Short Log Manager",
+                "daily-auto-stock-log-archive": "Stock Log Archive",
                 "daily-swing-log-archive": "Coin Long Log Manager",
             }
             if program.target_key in labels:
@@ -1771,32 +2347,20 @@ def render_page(message: str = "") -> bytes:
         if item.key == "auto_coin_bot":
             regime_entries = load_short_regime_entries()
             if regime_entries:
-                regime_rows = []
-                for entry in regime_entries:
-                    regime_rows.append(
-                        f"""
-                        <li class="regime-row">
-                          <div class="regime-main">
-                            <strong>{html.escape(entry.exchange)} {html.escape(entry.symbol)}</strong>
-                            <span class="badge small partial">{html.escape(entry.regime)}</span>
-                          </div>
-                          <div class="regime-meta">
-                            거래량 {html.escape(entry.volume_ratio)} · 이격도 {html.escape(entry.gap_pct)} · RSI {html.escape(entry.rsi)}
-                          </div>
-                        </li>
-                        """
-                    )
                 regime_body_id = f"regime-box-body-{item.key}"
                 regime_storage_key = f"regime-box:{item.key}"
                 regime_section = (
                     f'<section class="regime-box collapsible-regime-box" data-storage-key="{regime_storage_key}">'
                     '<div class="regime-box-header">'
                     '<h4>현재 레짐</h4>'
+                    '<div class="summary-actions">'
+                    f'<a class="ghost tool-link-button" href="/regime-snapshot" target="_blank" rel="noopener">전체 보기</a>'
                     f'<button type="button" class="ghost tool-button regime-collapse-button" '
                     f'data-target="{regime_body_id}" data-storage-key="{regime_storage_key}">접기</button>'
                     '</div>'
+                    '</div>'
                     f'<div class="regime-box-body" id="{regime_body_id}">'
-                    f'<ul class="regime-list">{"".join(regime_rows)}</ul>'
+                    f'{render_regime_stage_overview(regime_entries, show_coins=True, layout="flow", size="compact")}'
                     '</div>'
                     '</section>'
                 )
@@ -2145,6 +2709,12 @@ def render_page(message: str = "") -> bytes:
       gap: 14px;
       align-items: start;
     }}
+    .grid[data-group-key="coin"] {{
+      grid-template-columns: minmax(0, 1fr);
+    }}
+    .grid[data-group-key="coin"] .card.wide {{
+      grid-column: auto;
+    }}
     .group-block {{
       margin-top: 22px;
     }}
@@ -2353,37 +2923,110 @@ def render_page(message: str = "") -> bytes:
     .regime-box-body.is-collapsed {{
       display: none;
     }}
-    .regime-list {{
-      list-style: none;
-      margin: 0;
-      padding: 0;
-      display: grid;
-      gap: 8px;
-    }}
-    .regime-row {{
+    .regime-board {{
       border: 1px solid var(--line);
-      border-radius: 12px;
+      border-radius: 16px;
       background: #fbf6ef;
-      padding: 10px 12px;
+      padding: 8px;
+      overflow: hidden;
+    }}
+    .regime-board.regime-board-flow {{
+      overflow-x: auto;
+    }}
+    .regime-board.regime-board-compact {{
+      padding: 6px;
+    }}
+    .regime-flow {{
       display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+      width: 100%;
+    }}
+    .regime-flow.regime-flow-horizontal {{
+      display: flex;
+      gap: 6px;
+      align-items: stretch;
+      flex-wrap: nowrap;
+      min-width: 980px;
+      width: max-content;
+    }}
+    .regime-stage {{
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 8px;
+      display: grid;
+      gap: 4px;
+      background: #fbf6ef;
+    }}
+    .regime-stage-head {{
+      display: grid;
+      gap: 2px;
+    }}
+    .regime-stage-name {{
+      font-size: 10px;
+      font-weight: 800;
+      line-height: 1.15;
+      word-break: break-word;
+      letter-spacing: -0.02em;
+    }}
+    .regime-stage-coins {{
+      font-size: 9px;
+      line-height: 1.15;
+      color: var(--muted);
+      word-break: break-word;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      overflow: hidden;
+    }}
+    .regime-arrow {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 12px;
+      flex: 0 0 12px;
+      font-size: 11px;
+      font-weight: 800;
+      color: #8d806d;
+    }}
+    .regime-board-compact .regime-flow.regime-flow-horizontal {{
+      gap: 6px;
+      min-width: 980px;
+    }}
+    .regime-board-compact .regime-stage {{
+      border-radius: 8px;
+      padding: 10px 8px;
       gap: 6px;
     }}
-    .regime-main {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      flex-wrap: wrap;
+    .regime-board-compact .regime-stage-name {{
+      font-size: 10px;
+      line-height: 1.2;
     }}
-    .regime-main strong {{
-      font-size: 13px;
-      line-height: 1.4;
+    .regime-board-compact .regime-stage-coins {{
+      font-size: 9px;
+      line-height: 1.3;
     }}
-    .regime-meta {{
-      font-size: 12px;
-      line-height: 1.5;
-      color: var(--muted);
+    .regime-board-compact .regime-arrow {{
+      min-width: 12px;
+      flex: 0 0 12px;
+      font-size: 11px;
     }}
+    .regime-board-compact .regime-arrow {{
+      min-width: 10px;
+      flex: 0 0 10px;
+      font-size: 9px;
+    }}
+    .regime-low-energy {{ background: #dfe7f1; color: #35506e; }}
+    .regime-choppy-low {{ background: #efe4b7; color: #7a5d00; }}
+    .regime-choppy-high {{ background: #f6dbb9; color: #8b5700; }}
+    .regime-breakout {{ background: #d6f1db; color: #1f7a49; }}
+    .regime-trending-early {{ background: #d8f0ea; color: #156c60; }}
+    .regime-trending-mature {{ background: #cfe3fb; color: #1e4f8f; }}
+    .regime-exhaustion {{ background: #f5dfc1; color: #8d5600; }}
+    .regime-overheated {{ background: #f1d9d9; color: #9f2f2f; }}
+    .regime-unknown {{ background: #e6dccf; color: #2f2a25; }}
     .manage-card .program-sections {{
       grid-template-columns: minmax(0, 1fr);
     }}
@@ -2969,18 +3612,24 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if parsed.path in {"/backtest-summary", "/backtest-summary/download", "/backtest-summaries"}:
+        if parsed.path in {"/backtest-summary", "/backtest-summary/download", "/backtest-summaries", "/regime-snapshot"}:
             authorized, grant_cookie = check_request_authorization(self)
             if not authorized:
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             query = parse_qs(parsed.query)
-            if parsed.path == "/backtest-summaries":
+            if parsed.path == "/regime-snapshot":
+                body = render_short_regime_page(load_short_regime_entries())
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            elif parsed.path == "/backtest-summaries":
                 body = render_backtest_summary_list_page(list_backtest_summaries())
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             else:
                 requested_path = query.get("path", [""])[0]
+                completed_raw = (query.get("completed", [""])[0] or "").strip().lower()
+                show_completed_banner = completed_raw in {"1", "true", "yes", "y", "on"}
                 summary_path = (
                     resolve_backtest_summary(requested_path)
                     if requested_path
@@ -2998,7 +3647,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                         f'attachment; filename="{summary_path.parent.name}__{summary_path.name}"',
                     )
                 else:
-                    body = render_backtest_summary_page(summary_path)
+                    body = render_backtest_summary_page(
+                        summary_path,
+                        show_completed_banner=show_completed_banner,
+                    )
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
             if grant_cookie:
@@ -3052,6 +3704,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(content_length).decode("utf-8")
         form = parse_qs(raw)
 
+        redirect_after_tool: str | None = None
         if parsed.path == "/apply":
             turn_on = form.get("desired_state", ["off"])[-1] == "on"
             append_server_log(f"웹 전체 제어 요청 수신: {'켜짐' if turn_on else '꺼짐'}")
@@ -3080,7 +3733,12 @@ class ControlHandler(BaseHTTPRequestHandler):
             service_key = form.get("service_key", [""])[0]
             tool_key = form.get("tool_key", [""])[0]
             append_server_log(f"웹 도구 실행 요청 수신: service={service_key} tool={tool_key}")
-            message = run_tool_action(service_key, tool_key)
+            message, redirect_after_tool = run_tool_action(service_key, tool_key)
+        elif parsed.path == "/delete-backtest-batch":
+            batch_path = form.get("batch_path", [""])[0]
+            append_server_log(f"웹 백테스트 배치 삭제 요청 수신: path={batch_path}")
+            message = delete_pending_backtest_batch(batch_path)
+            redirect_after_tool = "/backtest-summaries"
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -3088,7 +3746,11 @@ class ControlHandler(BaseHTTPRequestHandler):
         STATE.set_message(message)
 
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/")
+        if parsed.path == "/run-tool" and redirect_after_tool:
+            location = redirect_after_tool
+        else:
+            location = "/"
+        self.send_header("Location", location)
         self.end_headers()
 
     def log_message(self, format: str, *args: object) -> None:

@@ -67,6 +67,8 @@ Telegram
 - `scripts/run_start_managed_services.sh`: launchd 에서 호출하는 시작 래퍼
 - `scripts/run_remote_manager.sh`: 실행 보조 스크립트
 - `launchd/com.plo.remotebot.plist`: macOS launchd 예시 파일
+- `DESIGN.md`: Codex가 웹 UI 작업 시 참고할 Apple-inspired 디자인 가이드
+- `docs/design-integration.md`: `awesome-design-md` 기반 로컬 적용 방법
 
 ## 보안 원칙
 

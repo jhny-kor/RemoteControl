@@ -68,6 +68,14 @@ class TelegramSettings:
 
 
 @dataclass(frozen=True)
+class IMessageSettings:
+    """iMessage 알림 설정."""
+
+    enabled: bool
+    recipients: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ManagerSettings:
     """매니저 공통 설정."""
 
@@ -83,6 +91,7 @@ class AppConfig:
     """애플리케이션 전체 설정."""
 
     telegram: TelegramSettings
+    imessage: IMessageSettings
     manager: ManagerSettings
     projects: dict[str, ProjectConfig]
 
@@ -150,6 +159,11 @@ def load_config(config_path: Path) -> AppConfig:
         poll_interval_sec=int(telegram_raw.get("poll_interval_sec", 5)),
         offset_path=offset_path,
     )
+    imessage_raw = raw.get("imessage", {})
+    imessage = IMessageSettings(
+        enabled=bool(imessage_raw.get("enabled", False)),
+        recipients=tuple(str(item) for item in imessage_raw.get("recipients", [])),
+    )
 
     jobs_dir = resolve_app_path(manager_raw.get("jobs_dir", "logs/jobs"))
     manager = ManagerSettings(
@@ -192,7 +206,12 @@ def load_config(config_path: Path) -> AppConfig:
         )
         projects[name] = project
 
-    return AppConfig(telegram=telegram, manager=manager, projects=projects)
+    return AppConfig(
+        telegram=telegram,
+        imessage=imessage,
+        manager=manager,
+        projects=projects,
+    )
 
 
 def telegram_api_request(
@@ -273,6 +292,41 @@ def send_broadcast_message(bot_token: str, chat_ids: set[str], text: str) -> Non
         send_message(bot_token, chat_id, text)
 
 
+def send_imessage_message(recipient: str, text: str) -> None:
+    """Messages.app 을 통해 iMessage 를 전송한다."""
+    script = """
+on run argv
+    set targetRecipient to item 1 of argv
+    set targetMessage to item 2 of argv
+    tell application "Messages"
+        set targetService to 1st service whose service type = iMessage
+        try
+            set targetBuddy to buddy targetRecipient of targetService
+            send targetMessage to targetBuddy
+        on error
+            set targetParticipant to participant targetRecipient of targetService
+            send targetMessage to targetParticipant
+        end try
+    end tell
+end run
+"""
+    subprocess.run(
+        ["osascript", "-", recipient, text],
+        input=script,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+
+def send_imessage_broadcast(recipients: tuple[str, ...], text: str) -> None:
+    """설정된 모든 iMessage 수신자에게 같은 메시지를 전송한다."""
+    for recipient in recipients:
+        if recipient.strip():
+            send_imessage_message(recipient.strip(), text)
+
+
 def load_bot_token(config: AppConfig) -> str:
     """환경 변수에서 텔레그램 봇 토큰을 읽는다."""
     load_dotenv(APP_ROOT / ".env")
@@ -302,13 +356,21 @@ def notify_manager_lifecycle(
     event: str,
     detail_lines: list[str] | None = None,
 ) -> None:
-    """매니저 시작/종료 알림을 텔레그램으로 전송한다."""
-    if not bot_token or not config.telegram.allowed_chat_ids:
-        return
-
     text = build_lifecycle_message(event, detail_lines=detail_lines)
-    send_broadcast_message(bot_token, config.telegram.allowed_chat_ids, text)
-    append_manager_log(config, f"lifecycle notification sent: event={event}")
+    delivered = False
+
+    if bot_token and config.telegram.allowed_chat_ids:
+        send_broadcast_message(bot_token, config.telegram.allowed_chat_ids, text)
+        append_manager_log(config, f"telegram lifecycle notification sent: event={event}")
+        delivered = True
+
+    if config.imessage.enabled and config.imessage.recipients:
+        send_imessage_broadcast(config.imessage.recipients, text)
+        append_manager_log(config, f"imessage lifecycle notification sent: event={event}")
+        delivered = True
+
+    if delivered:
+        append_manager_log(config, f"lifecycle notification sent: event={event}")
 
 
 def chunk_text(text: str, limit: int) -> list[str]:

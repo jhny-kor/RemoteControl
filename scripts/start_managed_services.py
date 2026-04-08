@@ -19,6 +19,7 @@ if str(APP_ROOT) not in sys.path:
 from remote_manager import APP_ROOT as REMOTE_APP_ROOT
 from remote_manager import build_lifecycle_message
 from remote_manager import load_dotenv
+from remote_manager import send_imessage_broadcast
 from remote_manager import send_message
 
 
@@ -73,16 +74,31 @@ def notify_startup(
     telegram_raw = raw_config.get("telegram", {})
     bot_token_env = str(telegram_raw.get("bot_token_env", "REMOTE_BOT_TELEGRAM_BOT_TOKEN"))
     chat_ids = [str(chat_id) for chat_id in telegram_raw.get("allowed_chat_ids", [])]
+    imessage_raw = raw_config.get("imessage", {})
+    imessage_enabled = bool(imessage_raw.get("enabled", False))
+    imessage_recipients = tuple(str(item) for item in imessage_raw.get("recipients", []))
 
     load_dotenv(REMOTE_APP_ROOT / ".env")
     bot_token = os.getenv(bot_token_env, "").strip()
-    if not bot_token or not chat_ids:
+
+    text = build_lifecycle_message(event, detail_lines=detail_lines)
+    delivered = False
+
+    if bot_token and chat_ids:
+        for chat_id in sorted(set(chat_ids)):
+            send_message(bot_token, chat_id, text)
+        append_log(log_path, f"startup telegram notification sent | event={event}")
+        delivered = True
+
+    if imessage_enabled and imessage_recipients:
+        send_imessage_broadcast(imessage_recipients, text)
+        append_log(log_path, f"startup imessage notification sent | event={event}")
+        delivered = True
+
+    if not delivered:
         append_log(log_path, f"startup_notification_skipped | event={event}")
         return
 
-    text = build_lifecycle_message(event, detail_lines=detail_lines)
-    for chat_id in sorted(set(chat_ids)):
-        send_message(bot_token, chat_id, text)
     append_log(log_path, f"startup_notification_sent | event={event}")
 
 

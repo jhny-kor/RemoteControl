@@ -4,6 +4,10 @@ allowed_chat_ids = ["8672076449"]
 poll_interval_sec = 5
 offset_path = "logs/telegram_manager.offset"
 
+[imessage]
+enabled = true
+recipients = ["y2kthr@hanmail.net"]
+
 [manager]
 codex_bin = "/Applications/Codex.app/Contents/Resources/codex"
 jobs_dir = "logs/jobs"
@@ -21,6 +25,7 @@ okx_btc = "OKX BTC EMA 봇"
 telegram = "텔레그램 명령 리스너"
 upbit = "업비트 봇"
 upbit_btc = "업비트 BTC EMA 봇"
+upbit_stream = "업비트 웹소켓 수집기"
 
 [projects.auto_coin_bot.commands]
 status = ".venv/bin/python bot_manager.py status"
@@ -46,13 +51,24 @@ description = "한국투자증권 기반 자동주식 프로젝트"
 
 [projects.auto_stock_bot.managed_programs]
 collector = "한국주식 분석 수집기"
+kr_long = "국장 장타 시그널 러너"
+kr_short = "국장 단타 시그널 러너"
+kr_long_trade = "국장 장타 주문 엔진"
+kr_short_trade = "국장 단타 주문 엔진"
+telegram = "텔레그램 명령 리스너"
+reporter = "일일 리포트 스케줄러"
+disclosure = "중요 공시 감시기"
+orderwatch = "주문 상태 감시기"
 
 [projects.auto_stock_bot.commands]
-status = ".venv/bin/python scripts/kis_check_connection.py"
+status = ".venv/bin/python bot_manager.py status"
+start_all = ".venv/bin/python bot_manager.py start all"
+stop_all = ".venv/bin/python bot_manager.py stop all"
 quote_check = ".venv/bin/python scripts/kis_quote_check.py"
 
 [projects.auto_stock_bot.autostart]
-enabled = false
+enabled = true
+command_key = "start_all"
 
 [projects.auto_stock_bot.codex]
 sandbox = "workspace-write"
@@ -68,12 +84,14 @@ description = "Codex 자동화와 로컬 jobs를 실행하는 배치 매니저"
 "automation-2" = "오늘 공모주 텔레그램 전송"
 "automation-3" = "주간 공모주 텔레그램 전송"
 "daily-auto-coin-log-archive" = "auto_coin_bot 로그 압축 워크플로"
+"daily-auto-stock-log-archive" = "auto_stock_bot 로그 압축 워크플로"
 "daily-swing-log-archive" = "auto_coin_bot_swing 로그 압축 워크플로"
 
 [projects.batch_bot.program_schedules]
 "automation-2" = "매일 06:00"
 "automation-3" = "매주 월 08:30"
 "daily-auto-coin-log-archive" = "매일 06:00"
+"daily-auto-stock-log-archive" = "매일 06:10"
 "daily-swing-log-archive" = "매일 06:05"
 
 [projects.batch_bot.commands]
@@ -85,7 +103,8 @@ stop = "zsh scripts/manage_launch_agent.sh stop"
 logs = "zsh scripts/manage_launch_agent.sh logs"
 
 [projects.batch_bot.autostart]
-enabled = false
+enabled = true
+command_key = "reload"
 
 [projects.batch_bot.codex]
 sandbox = "workspace-write"
