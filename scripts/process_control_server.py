@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import calendar
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import html
 import importlib.util
@@ -15,16 +17,18 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlparse
-
+from urllib import request as urlrequest
 
 APP_ROOT = Path("/Users/plo/Documents/remoteBot")
 AUTO_COIN_ROOT = Path("/Users/plo/Documents/auto_coin_bot")
 AUTO_COIN_BACKTEST_ROOT = AUTO_COIN_ROOT / "reports/backtest_batches"
+AUTO_COIN_TRADE_LOG_ROOT = AUTO_COIN_ROOT / "trade_logs"
 AUTO_COIN_SWING_ROOT = Path("/Users/plo/Documents/auto_coin_bot_swing")
 AUTO_STOCK_ROOT = Path("/Users/plo/Documents/auto_stock_bot")
 AUTO_STOCK_SRC = AUTO_STOCK_ROOT / "src"
@@ -39,10 +43,208 @@ OUT_PATH = APP_ROOT / "logs/process_control_server.out"
 ACCESS_KEY_PATH = APP_ROOT / "logs/process_control_access_key.txt"
 ACCESS_COOKIE_NAME = "remotebot_access"
 TOOL_RUN_LOG_DIR = APP_ROOT / "logs" / "tool_runs"
+REGIME_CACHE_PATH = APP_ROOT / "logs" / "current_regime_snapshot_cache.json"
+IPO_TOOL_RESULT_PATH = TOOL_RUN_LOG_DIR / "ipo_schedule_check_latest.txt"
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 MAX_LOG_LINES = 120
 BACKTEST_SUMMARY_FILENAMES = {"batch_summary.md", "diff_summary.md"}
 RECENT_BACKTEST_SUMMARY_LIMIT = 6
+
+
+IPO_SCHEDULE_URL = "http://www.38.co.kr/html/fund/index.htm?o=k"
+IPO_SCHEDULE_FALLBACK_URL = "http://211.239.159.227/html/fund/index.htm?o=k"
+IPO_TABLE_RE = re.compile(
+    r'<table[^>]*summary="공모주 청약일정"[^>]*>.*?<tbody>(?P<tbody>.*?)</tbody>',
+    re.DOTALL,
+)
+IPO_ROW_RE = re.compile(r"<tr[^>]*>(?P<row>.*?)</tr>", re.DOTALL)
+IPO_CELL_RE = re.compile(r"<td[^>]*>(?P<cell>.*?)</td>", re.DOTALL)
+IPO_TAG_RE = re.compile(r"<[^>]+>")
+IPO_SPACE_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class IpoScheduleRow:
+    name: str
+    subscription_period: str
+    fixed_offer_price: str
+    target_offer_price: str
+    competition_rate: str
+    lead_underwriters: str
+    source_path: str | None = None
+
+
+def _ipo_clean_cell(raw: str) -> str:
+    without_tags = IPO_TAG_RE.sub(" ", raw)
+    normalized = IPO_SPACE_RE.sub(" ", without_tags)
+    return normalized.replace("&nbsp;", " ").replace(" ", " ").strip()
+
+
+def _ipo_extract_href(raw_row_html: str) -> str | None:
+    match = re.search(r'href="(?P<href>/html/fund/\?o=v[^"]+)"', raw_row_html)
+    if not match:
+        return None
+    return match.group("href").replace("&amp;", "&")
+
+
+def fetch_ipo_schedule_rows() -> list[IpoScheduleRow]:
+    last_error: Exception | None = None
+    candidates = [
+        (IPO_SCHEDULE_URL, {"User-Agent": "Mozilla/5.0"}),
+        (IPO_SCHEDULE_FALLBACK_URL, {"User-Agent": "Mozilla/5.0", "Host": "www.38.co.kr"}),
+    ]
+    html = None
+    for url, headers in candidates:
+        try:
+            req = urlrequest.Request(url, headers=headers)
+            with urlrequest.urlopen(req, timeout=15) as response:
+                raw = response.read()
+            html = raw.decode("euc-kr", errors="replace")
+            break
+        except Exception as exc:
+            last_error = exc
+    if html is None:
+        raise RuntimeError(f"공모주 일정 조회 실패: {last_error}")
+
+    table_match = IPO_TABLE_RE.search(html)
+    if not table_match:
+        raise RuntimeError("공모주 청약일정 테이블을 찾지 못했습니다.")
+
+    entries: list[IpoScheduleRow] = []
+    tbody = table_match.group("tbody")
+    for row_match in IPO_ROW_RE.finditer(tbody):
+        cells = [_ipo_clean_cell(cell_match.group("cell")) for cell_match in IPO_CELL_RE.finditer(row_match.group("row"))]
+        if len(cells) < 6:
+            continue
+        entries.append(
+            IpoScheduleRow(
+                name=cells[0],
+                subscription_period=cells[1],
+                fixed_offer_price=cells[2],
+                target_offer_price=cells[3],
+                competition_rate=cells[4],
+                lead_underwriters=cells[5],
+                source_path=_ipo_extract_href(row_match.group("row")),
+            )
+        )
+    return entries
+
+
+def format_ipo_schedule_rows(entries: list[IpoScheduleRow], limit: int = 5) -> str:
+    lines = ["[공모주 청약일정]"]
+    for entry in entries[:limit]:
+        lines.append(f"- {entry.name} | {entry.subscription_period}")
+        lines.append(f"  희망공모가: {entry.target_offer_price}")
+        if entry.fixed_offer_price and entry.fixed_offer_price != "-":
+            lines.append(f"  확정공모가: {entry.fixed_offer_price}")
+        if entry.lead_underwriters:
+            lines.append(f"  주간사: {entry.lead_underwriters}")
+        if entry.source_path:
+            lines.append(f"  출처: https://www.38.co.kr{entry.source_path}")
+    if len(entries) == 0:
+        lines.append("- 예정된 공모주 청약 일정이 보이지 않습니다.")
+    return "\n".join(lines)
+
+
+def save_tool_result(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def render_tool_text_page(title: str, text: str) -> bytes:
+    page = f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0b0f">
+  <title>{html.escape(title)}</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {{
+      --bg-dark: #020204;
+      --bg-light: #f5f5f7;
+      --card: rgba(255, 255, 255, 0.96);
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: rgba(29, 29, 31, 0.08);
+      --blue: #0071e3;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.18), transparent 24%),
+        linear-gradient(180deg, var(--bg-dark) 0%, #101114 24%, var(--bg-light) 24.1%, var(--bg-light) 100%);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }}
+    .card {{
+      background: var(--card);
+      border-radius: 28px;
+      padding: 26px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.78);
+    }}
+    h1 {{
+      margin: 0;
+      font-size: clamp(32px, 5vw, 46px);
+      letter-spacing: -0.04em;
+      line-height: 1.06;
+    }}
+    .actions {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 18px 0;
+    }}
+    a {{
+      border-radius: 999px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--blue);
+      color: white;
+      box-shadow: 0 8px 20px rgba(0, 113, 227, 0.20);
+    }}
+    pre {{
+      margin: 0;
+      padding: 20px;
+      border-radius: 22px;
+      background: #f8f8fb;
+      border: 1px solid var(--line);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      font-size: 14px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>{html.escape(title)}</h1>
+      <div class="actions">
+        <a href="/">메인으로</a>
+      </div>
+      <pre>{html.escape(text)}</pre>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -109,6 +311,20 @@ class ServiceSpec:
     expected_running_sections: int
 
 
+SERVER_MANAGER_CACHE_TTL_SEC = 15.0
+SERVER_MANAGER_CACHE_LOCK = threading.Lock()
+SERVER_MANAGER_CACHE: tuple[float, ServiceStatus] | None = None
+SERVICE_STATUS_CACHE_TTL_SEC = 8.0
+SERVICE_STATUS_CACHE_LOCK = threading.Lock()
+SERVICE_STATUS_CACHE: tuple[float, list[ServiceStatus]] | None = None
+MONTHLY_PNL_CACHE_TTL_SEC = 30.0
+MONTHLY_PNL_CACHE_LOCK = threading.Lock()
+MONTHLY_PNL_CACHE: dict[tuple[int, int], tuple[float, dict[int, dict[str, float]]]] = {}
+REGIME_CACHE_TTL_SEC = 60.0
+REGIME_CACHE_LOCK = threading.Lock()
+REGIME_CACHE: tuple[float, list["RegimeEntry"]] | None = None
+
+
 REGIME_STAGE_SEQUENCE: tuple[str, ...] = (
     "LOW_ENERGY",
     "CHOPPY_LOW_VOL",
@@ -126,7 +342,7 @@ SERVICES = [
         key="remote_manager",
         group="manage",
         title="원격 매니저",
-        subtitle="텔레그램 원격 제어 매니저",
+        subtitle="텔레그램 원격 제어",
         status_command=CommandSpec(
             cwd=APP_ROOT,
             argv=[sys.executable, str(APP_ROOT / "remote_manager.py"), "--status"],
@@ -146,7 +362,7 @@ SERVICES = [
         key="auto_coin_bot",
         group="coin",
         title="Short",
-        subtitle="auto_coin_bot 단기 코인 자동매매",
+        subtitle="코인 단타 자동매매",
         status_command=CommandSpec(
             cwd=AUTO_COIN_ROOT,
             argv=[str(AUTO_COIN_ROOT / ".venv/bin/python"), "bot_manager.py", "status"],
@@ -165,8 +381,8 @@ SERVICES = [
     ServiceSpec(
         key="auto_coin_bot_swing",
         group="coin",
-        title="Long",
-        subtitle="auto_coin_bot_swing 스윙 코인 자동매매",
+        title="Swing",
+        subtitle="코인 스윙 자동매매",
         status_command=CommandSpec(
             cwd=AUTO_COIN_SWING_ROOT,
             argv=[str(AUTO_COIN_SWING_ROOT / ".venv/bin/python"), "bot_manager.py", "status"],
@@ -185,7 +401,7 @@ SERVICES = [
     ServiceSpec(
         key="auto_stock_bot",
         group="stock",
-        title="가치투자",
+        title="가치투자🤣",
         subtitle="한국주식 자동매매/분석 수집기",
         status_command=CommandSpec(
             cwd=AUTO_STOCK_ROOT,
@@ -205,8 +421,8 @@ SERVICES = [
     ServiceSpec(
         key="batch_bot",
         group="manage",
-        title="배치 메니저",
-        subtitle="Codex 자동화와 로컬 jobs 실행 배치 매니저",
+        title="배치 매니저",
+        subtitle="Jobs 실행 배치 매니저",
         status_command=CommandSpec(
             cwd=Path("/Users/plo/Documents/batchBot"),
             argv=["zsh", "scripts/manage_launch_agent.sh", "status"],
@@ -711,6 +927,262 @@ def build_backtest_summary_href(summary_path: Path, *, download: bool = False) -
     return f"{base}?path={quote(relative_path, safe='/')}"
 
 
+def safe_float(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def kib_to_human(size_kib: int) -> str:
+    size = float(size_kib)
+    units = ["KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def format_duration_korean(total_seconds: int) -> str:
+    minutes, _ = divmod(max(0, total_seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}일")
+    if hours:
+        parts.append(f"{hours}시간")
+    if minutes or not parts:
+        parts.append(f"{minutes}분")
+    return " ".join(parts)
+
+
+def parse_boot_time() -> datetime | None:
+    ok, output = run_quick_command(["who", "-b"], timeout_sec=3)
+    if not ok or not output:
+        return None
+
+    normalized = " ".join(output.split())
+    if "system boot" not in normalized:
+        return None
+
+    raw_value = normalized.split("system boot", 1)[1].strip()
+    now = datetime.now()
+    for year in (now.year, now.year - 1):
+        try:
+            candidate = datetime.strptime(f"{year} {raw_value}", "%Y %b %d %H:%M")
+        except ValueError:
+            continue
+        if candidate <= now:
+            return candidate
+    return None
+
+
+def interpret_load_average(load_1m: float) -> str:
+    if load_1m < 1.5:
+        return "낮음"
+    if load_1m < 3.0:
+        return "보통"
+    if load_1m < 6.0:
+        return "높음"
+    return "매우 높음"
+
+
+def format_pnl_amount(value: float, currency: str) -> str:
+    sign = "+" if value > 0 else ""
+    if currency == "KRW":
+        return f"{sign}{value:,.0f} KRW"
+    if currency == "USDT":
+        return f"{sign}{value:,.3f} USDT"
+    return f"{sign}{value:,.3f} {currency}"
+
+
+def load_auto_coin_monthly_pnl(year: int, month: int) -> dict[int, dict[str, float]]:
+    cache_key = (year, month)
+    now_monotonic = time.monotonic()
+    with MONTHLY_PNL_CACHE_LOCK:
+        cached = MONTHLY_PNL_CACHE.get(cache_key)
+        if cached is not None and now_monotonic - cached[0] < MONTHLY_PNL_CACHE_TTL_SEC:
+            return {day: values.copy() for day, values in cached[1].items()}
+
+    if not AUTO_COIN_TRADE_LOG_ROOT.exists():
+        return {}
+
+    prefix = f"{year:04d}-{month:02d}-"
+    daily_totals: dict[int, dict[str, float]] = {}
+
+    for day_dir in sorted(AUTO_COIN_TRADE_LOG_ROOT.iterdir()):
+        if not day_dir.is_dir() or not day_dir.name.startswith(prefix):
+            continue
+        history_path = day_dir / "trade_history.jsonl"
+        if not history_path.is_file():
+            continue
+
+        try:
+            lines = history_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            pnl_value = safe_float(record.get("net_realized_pnl_quote"))
+            if pnl_value is None:
+                pnl_value = safe_float(record.get("realized_pnl_quote"))
+            if pnl_value is None:
+                continue
+
+            local_time = str(record.get("recorded_at_local") or record.get("recorded_at") or "").strip()
+            date_text = local_time[:10] if len(local_time) >= 10 else day_dir.name
+            if not date_text.startswith(prefix):
+                continue
+
+            try:
+                day_number = int(date_text[-2:])
+            except ValueError:
+                continue
+
+            currency = str(record.get("quote_currency") or "QUOTE").strip() or "QUOTE"
+            bucket = daily_totals.setdefault(day_number, {})
+            bucket[currency] = bucket.get(currency, 0.0) + pnl_value
+
+    with MONTHLY_PNL_CACHE_LOCK:
+        MONTHLY_PNL_CACHE[cache_key] = (
+            time.monotonic(),
+            {day: values.copy() for day, values in daily_totals.items()},
+        )
+
+    return daily_totals
+
+
+def shift_year_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    zero_based = (year * 12 + (month - 1)) + delta
+    shifted_year, shifted_month_zero = divmod(zero_based, 12)
+    return shifted_year, shifted_month_zero + 1
+
+
+def parse_pnl_month(raw_value: str | None) -> tuple[int, int]:
+    now = datetime.now()
+    if not raw_value:
+        return now.year, now.month
+    match = re.fullmatch(r"(\d{4})-(\d{2})", raw_value.strip())
+    if not match:
+        return now.year, now.month
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return now.year, now.month
+    return year, month
+
+
+def render_auto_coin_pnl_calendar(year: int, month: int) -> str:
+    today = datetime.now()
+    daily_totals = load_auto_coin_monthly_pnl(year, month)
+    month_matrix = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+    weekday_labels = ["일", "월", "화", "수", "목", "금", "토"]
+    selected_month_key = f"{year:04d}-{month:02d}"
+    previous_year, previous_month = shift_year_month(year, month, -1)
+    next_year, next_month = shift_year_month(year, month, 1)
+    previous_href = "/?" + urlencode({"pnl_month": f"{previous_year:04d}-{previous_month:02d}"})
+    next_href = "/?" + urlencode({"pnl_month": f"{next_year:04d}-{next_month:02d}"})
+
+    summary_totals: dict[str, float] = {}
+    positive_days = 0
+    negative_days = 0
+    for day_totals in daily_totals.values():
+        day_sum = sum(day_totals.values())
+        if day_sum > 0:
+            positive_days += 1
+        elif day_sum < 0:
+            negative_days += 1
+        for currency, value in day_totals.items():
+            summary_totals[currency] = summary_totals.get(currency, 0.0) + value
+
+    summary_html = "".join(
+        f'<span class="pnl-summary-chip {"positive" if value > 0 else "negative" if value < 0 else "flat"}">{html.escape(format_pnl_amount(value, currency))}</span>'
+        for currency, value in sorted(summary_totals.items())
+    ) or '<span class="pnl-summary-chip flat">이번 달 실현 손익 없음</span>'
+
+    weekday_html = "".join(f'<div class="pnl-weekday">{label}</div>' for label in weekday_labels)
+
+    day_cells: list[str] = []
+    for week in month_matrix:
+        for day in week:
+            if day == 0:
+                day_cells.append('<div class="pnl-day is-empty"></div>')
+                continue
+
+            totals = daily_totals.get(day, {})
+            total_value = sum(totals.values()) if totals else 0.0
+            state_class = "positive" if total_value > 0 else "negative" if total_value < 0 else "flat"
+            today_class = " is-today" if (year, month, day) == (today.year, today.month, today.day) else ""
+            values_html = "".join(
+                f'<span class="pnl-value {("positive" if value > 0 else "negative" if value < 0 else "flat")}">{html.escape(format_pnl_amount(value, currency))}</span>'
+                for currency, value in sorted(totals.items())
+            ) or '<span class="pnl-value flat">-</span>'
+
+            day_cells.append(
+                f"""
+                <div class="pnl-day {state_class}{today_class}">
+                  <div class="pnl-day-head">
+                    <span class="pnl-day-number">{day}</span>
+                  </div>
+                  <div class="pnl-day-values">
+                    {values_html}
+                  </div>
+                </div>
+                """
+            )
+
+    return f"""
+        <section class="pnl-box collapsible-pnl-box" data-storage-key="pnl-calendar">
+          <div class="pnl-box-header">
+            <div>
+              <h4>월간 PnL 캘린더</h4>
+              <p class="pnl-caption">{year}년 {month}월 실현 손익 기준입니다.</p>
+            </div>
+            <div class="pnl-summary">
+              {summary_html}
+              <span class="pnl-summary-meta">수익일 {positive_days}일 · 손실일 {negative_days}일</span>
+            </div>
+          </div>
+          <div class="pnl-toolbar">
+            <div class="pnl-nav">
+              <a class="ghost tool-link-button" href="{html.escape(previous_href)}">이전월</a>
+              <span class="pnl-month-label">{selected_month_key}</span>
+              <a class="ghost tool-link-button" href="{html.escape(next_href)}">다음월</a>
+            </div>
+            <button
+              type="button"
+              class="ghost tool-button section-collapse-button"
+              data-target="pnl-calendar-body"
+              data-storage-key="pnl-calendar"
+            >
+              접기
+            </button>
+          </div>
+          <div class="pnl-calendar-body" id="pnl-calendar-body">
+            <div class="pnl-calendar">
+              {weekday_html}
+              {"".join(day_cells)}
+            </div>
+          </div>
+        </section>
+    """
+
+
 def render_backtest_summary_page(
     summary_path: Path, *, show_completed_banner: bool = False
 ) -> bytes:
@@ -729,52 +1201,57 @@ def render_backtest_summary_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1f7a49">
+  <meta name="theme-color" content="#0b0b0f">
   <title>백테스트 요약</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     :root {{
-      --bg: #efe7dc;
-      --card: #fbf8f3;
-      --text: #1f1a17;
-      --muted: #625b53;
-      --line: #ddd2c2;
-      --green: #1f7a49;
+      --bg-dark: #020204;
+      --bg-light: #f5f5f7;
+      --card: rgba(255, 255, 255, 0.96);
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: rgba(29, 29, 31, 0.08);
+      --blue: #0071e3;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: radial-gradient(circle at top left, #f5eee5 0%, var(--bg) 45%, #eadfcf 100%);
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.18), transparent 24%),
+        linear-gradient(180deg, var(--bg-dark) 0%, #101114 24%, var(--bg-light) 24.1%, var(--bg-light) 100%);
       color: var(--text);
     }}
     .wrap {{
       max-width: 1100px;
       margin: 0 auto;
-      padding: 28px 20px 40px;
+      padding: 28px 20px 48px;
     }}
     .card {{
       background: var(--card);
-      border-radius: 20px;
-      padding: 22px;
-      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+      border-radius: 28px;
+      padding: 26px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.78);
     }}
     .done-banner {{
       margin: 0 0 16px;
-      padding: 12px 16px;
-      border-radius: 14px;
-      background: #e8f5ec;
-      border: 1px solid #b8dcc4;
-      color: #134d2a;
+      padding: 14px 18px;
+      border-radius: 18px;
+      background: rgba(0, 113, 227, 0.10);
+      border: 1px solid rgba(0, 113, 227, 0.18);
+      color: #0056b3;
       font-size: 14px;
       font-weight: 600;
       line-height: 1.5;
     }}
     h1 {{
       margin: 0;
-      font-size: 30px;
-      letter-spacing: -0.03em;
+      font-size: clamp(32px, 5vw, 46px);
+      letter-spacing: -0.04em;
+      line-height: 1.06;
     }}
     .meta {{
       margin: 8px 0 18px;
@@ -788,28 +1265,30 @@ def render_backtest_summary_page(
       margin-bottom: 18px;
     }}
     a {{
-      border-radius: 12px;
-      padding: 10px 14px;
+      border-radius: 999px;
+      padding: 10px 16px;
       font-size: 14px;
-      font-weight: 700;
+      font-weight: 600;
       text-decoration: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
     }}
     .primary {{
-      background: var(--green);
+      background: var(--blue);
       color: white;
+      box-shadow: 0 8px 20px rgba(0, 113, 227, 0.20);
     }}
     .ghost {{
-      background: #e6dccf;
-      color: #2f2a25;
+      background: rgba(29, 29, 31, 0.05);
+      color: var(--text);
+      border: 1px solid rgba(29, 29, 31, 0.08);
     }}
     pre {{
       margin: 0;
-      padding: 18px;
-      border-radius: 16px;
-      background: #f6f0e7;
+      padding: 20px;
+      border-radius: 22px;
+      background: #f8f8fb;
       border: 1px solid var(--line);
       overflow-x: auto;
       white-space: pre-wrap;
@@ -905,41 +1384,46 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1f7a49">
+  <meta name="theme-color" content="#0b0b0f">
   <title>백테스트 요약 목록</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     :root {{
-      --bg: #efe7dc;
-      --card: #fbf8f3;
-      --text: #1f1a17;
-      --muted: #625b53;
-      --line: #ddd2c2;
-      --green: #1f7a49;
+      --bg-dark: #020204;
+      --bg-light: #f5f5f7;
+      --card: rgba(255, 255, 255, 0.96);
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: rgba(29, 29, 31, 0.08);
+      --blue: #0071e3;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: radial-gradient(circle at top left, #f5eee5 0%, var(--bg) 45%, #eadfcf 100%);
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.18), transparent 24%),
+        linear-gradient(180deg, var(--bg-dark) 0%, #101114 24%, var(--bg-light) 24.1%, var(--bg-light) 100%);
       color: var(--text);
     }}
     .wrap {{
       max-width: 1100px;
       margin: 0 auto;
-      padding: 28px 20px 40px;
+      padding: 28px 20px 48px;
     }}
     .card {{
       background: var(--card);
-      border-radius: 20px;
-      padding: 22px;
-      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+      border-radius: 28px;
+      padding: 26px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.78);
     }}
     h1 {{
       margin: 0;
-      font-size: 30px;
-      letter-spacing: -0.03em;
+      font-size: clamp(32px, 5vw, 46px);
+      letter-spacing: -0.04em;
+      line-height: 1.06;
     }}
     .meta {{
       margin: 8px 0 18px;
@@ -960,8 +1444,8 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
     }}
     h2 {{
       margin: 0;
-      font-size: 20px;
-      letter-spacing: -0.02em;
+      font-size: 24px;
+      letter-spacing: -0.03em;
     }}
     .summary-row {{
       display: grid;
@@ -969,9 +1453,9 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       gap: 10px;
       align-items: center;
       border: 1px solid var(--line);
-      border-radius: 14px;
-      background: #f7f0e6;
-      padding: 12px 14px;
+      border-radius: 20px;
+      background: #f8f8fb;
+      padding: 14px 16px;
     }}
     .summary-copy {{
       display: grid;
@@ -993,7 +1477,7 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       justify-content: flex-end;
     }}
     .pending-row {{
-      background: #f3eadf;
+      background: rgba(255, 248, 230, 0.96);
     }}
     .pending-actions {{
       align-items: flex-end;
@@ -1006,7 +1490,7 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       min-width: 78px;
       padding: 7px 10px;
       border-radius: 999px;
-      background: #efe4b7;
+      background: rgba(164, 107, 0, 0.14);
       color: #7a5d00;
       font-size: 12px;
       font-weight: 800;
@@ -1016,29 +1500,31 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
       font-size: 12px;
     }}
     a {{
-      border-radius: 12px;
-      padding: 10px 14px;
+      border-radius: 999px;
+      padding: 10px 16px;
       font-size: 13px;
-      font-weight: 700;
+      font-weight: 600;
       text-decoration: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
     }}
     .primary {{
-      background: var(--green);
+      background: var(--blue);
       color: white;
+      box-shadow: 0 8px 20px rgba(0, 113, 227, 0.20);
     }}
     .ghost {{
-      background: #e6dccf;
-      color: #2f2a25;
+      background: rgba(29, 29, 31, 0.05);
+      color: var(--text);
+      border: 1px solid rgba(29, 29, 31, 0.08);
     }}
     .danger {{
       border: 0;
-      border-radius: 12px;
-      padding: 10px 14px;
+      border-radius: 999px;
+      padding: 10px 16px;
       font-size: 13px;
-      font-weight: 700;
+      font-weight: 600;
       background: #a33b3b;
       color: white;
       cursor: pointer;
@@ -1447,26 +1933,297 @@ def build_service_detail(
     return "\n".join(detail_lines[:2]) if detail_lines else service.subtitle
 
 
-def get_all_statuses() -> list[ServiceStatus]:
-    results: list[ServiceStatus] = []
-    for service in SERVICES:
-        _, status_output = run_command(service.status_command)
-        programs_output = None
-        if service.programs_command is not None:
-            _, programs_output = run_command(service.programs_command)
-        detail = build_service_detail(service, status_output, programs_output)
-        results.append(
-            ServiceStatus(
-                key=service.key,
-                group=service.group,
-                title=service.title,
-                subtitle=service.subtitle,
-                state=parse_service_state(service, status_output),
-                detail=detail,
-                programs=build_programs(service, status_output, programs_output),
-            )
+def run_quick_command(argv: list[str], timeout_sec: int = 4) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
         )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False, ""
+    return completed.returncode == 0, strip_ansi((completed.stdout or "").strip())
+
+
+def build_dashboard_battery_text() -> str:
+    ok, output = run_quick_command(["pmset", "-g", "batt"], timeout_sec=3)
+    if not ok or not output:
+        return "배터리 상태\n확인 필요"
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return "배터리 상태\n확인 필요"
+
+    power_source = lines[0].replace("Now drawing from ", "").strip().strip("'")
+    detail = lines[1].split("\t")[-1].strip()
+    parts = [part.strip() for part in detail.split(";") if part.strip()]
+    level = parts[0] if parts else "-"
+    raw_status = parts[1].lower() if len(parts) > 1 else ""
+
+    source_label = "전원 연결" if power_source == "AC Power" else "배터리 사용"
+    status_map = {
+        "charging": "충전 중",
+        "discharging": "사용 중",
+        "charged": "충전 완료",
+        "finishing charge": "충전 마무리",
+    }
+    status_label = status_map.get(raw_status, raw_status or "-")
+    return (
+        "배터리 상태\n"
+        f"전원: {source_label}\n"
+        f"잔량: {level}\n"
+        f"상태: {status_label}"
+    )
+
+
+def build_dashboard_disk_text() -> str:
+    try:
+        stats = os.statvfs("/")
+    except OSError:
+        return "디스크 상태\n확인 필요"
+
+    block_size = stats.f_frsize or stats.f_bsize or 1024
+    total_kib = int((stats.f_blocks * block_size) / 1024)
+    available_kib = int((stats.f_bavail * block_size) / 1024)
+    used_kib = max(0, total_kib - available_kib)
+    capacity = f"{int((used_kib / total_kib) * 100) if total_kib else 0}%"
+    return (
+        "디스크 상태\n"
+        f"맥 전체 용량: {kib_to_human(total_kib)}\n"
+        f"맥 잔여 용량: {kib_to_human(available_kib)}\n"
+        f"사용 비율: {capacity}"
+    )
+
+
+def build_dashboard_wifi_text() -> str:
+    for interface in ("en0", "en1"):
+        ok, network_output = run_quick_command(
+            ["networksetup", "-getairportnetwork", interface],
+            timeout_sec=3,
+        )
+        if not ok or not network_output:
+            continue
+        if "You are not associated with an AirPort network." in network_output:
+            return (
+                "네트워크 상태\n"
+                f"인터페이스: {interface}\n"
+                "상태: 미연결"
+            )
+        if ":" in network_output:
+            ssid = network_output.split(":", 1)[1].strip()
+            _, ip_output = run_quick_command(["ipconfig", "getifaddr", interface], timeout_sec=2)
+            ip_line = f"\nIP: {ip_output}" if ip_output else ""
+            return (
+                "네트워크 상태\n"
+                f"인터페이스: {interface}\n"
+                f"상태: 연결됨\n"
+                f"SSID: {ssid}"
+                f"{ip_line}"
+            )
+    return "네트워크 상태\n확인 필요"
+
+
+def build_dashboard_load_text() -> str:
+    now = datetime.now()
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+        load_text = f"{load_1m:.2f} / {load_5m:.2f} / {load_15m:.2f}"
+        load_label = interpret_load_average(load_1m)
+    except (AttributeError, OSError):
+        load_text = "-"
+        load_label = "확인 필요"
+
+    boot_time = parse_boot_time()
+    lines = [
+        "시스템 부하",
+        f"현재 시각: {now.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"부하(1분/5분/15분): {load_text}",
+        f"부하 해석: {load_label}",
+    ]
+    if boot_time is not None:
+        uptime_seconds = int((now - boot_time).total_seconds())
+        lines.append(f"가동 시간: {format_duration_korean(uptime_seconds)}")
+    return "\n".join(lines)
+
+
+def server_metric_state(detail: str) -> str:
+    normalized = detail.lower()
+    failure_markers = (
+        "실패",
+        "찾지 못",
+        "초과",
+        "읽지 못",
+        "error",
+        "timeout",
+    )
+    if any(marker in normalized for marker in failure_markers):
+        return "error"
+    return "success"
+
+
+def find_detail_value(detail: str, prefixes: tuple[str, ...]) -> str | None:
+    for raw_line in detail.splitlines():
+        line = raw_line.strip()
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                return line.split(":", 1)[1].strip() if ":" in line else line
+    return None
+
+
+def build_server_manager_status() -> ServiceStatus:
+    global SERVER_MANAGER_CACHE
+
+    now_monotonic = time.monotonic()
+    with SERVER_MANAGER_CACHE_LOCK:
+        if (
+            SERVER_MANAGER_CACHE is not None
+            and now_monotonic - SERVER_MANAGER_CACHE[0] < SERVER_MANAGER_CACHE_TTL_SEC
+        ):
+            return SERVER_MANAGER_CACHE[1]
+
+    battery_text = build_dashboard_battery_text()
+    disk_text = build_dashboard_disk_text()
+    wifi_text = build_dashboard_wifi_text()
+    uptime_text = build_dashboard_load_text()
+
+    programs = [
+        ProgramStatus(
+            name="배터리",
+            state=server_metric_state(battery_text),
+            detail=battery_text,
+        ),
+        ProgramStatus(
+            name="저장 용량",
+            state=server_metric_state(disk_text),
+            detail=disk_text,
+        ),
+        ProgramStatus(
+            name="네트워크",
+            state=server_metric_state(wifi_text),
+            detail=wifi_text,
+        ),
+        ProgramStatus(
+            name="시스템 부하",
+            state=server_metric_state(uptime_text),
+            detail=uptime_text,
+        ),
+    ]
+
+    if all(program.state == "success" for program in programs):
+        state = "success"
+    elif any(program.state == "success" for program in programs):
+        state = "partial"
+    else:
+        state = "error"
+
+    battery_level = find_detail_value(battery_text, ("배터리 잔량",))
+    disk_available = find_detail_value(disk_text, ("맥 잔여 용량", "잔여 용량"))
+    wifi_status = find_detail_value(wifi_text, ("status",))
+    load_level = find_detail_value(uptime_text, ("부하 해석",))
+
+    summary_lines = [
+        "현재 서버의 핵심 상태를 빠르게 확인합니다.",
+        f"마지막 갱신: {now_text()}",
+    ]
+    if battery_level:
+        summary_lines.append(f"배터리: {battery_level}")
+    if disk_available:
+        summary_lines.append(f"저장 용량: 잔여 {disk_available}")
+    if wifi_status:
+        summary_lines.append(f"네트워크: {wifi_status}")
+    if load_level:
+        summary_lines.append(f"부하: {load_level}")
+
+    status = ServiceStatus(
+        key="server_manager",
+        group="manage",
+        title="서버 매니저",
+        subtitle="현재 서버의 상태 진단",
+        state=state,
+        detail="\n".join(summary_lines),
+        programs=programs,
+    )
+
+    with SERVER_MANAGER_CACHE_LOCK:
+        SERVER_MANAGER_CACHE = (time.monotonic(), status)
+
+    return status
+
+
+def collect_service_status(service: ServiceSpec) -> ServiceStatus:
+    _, status_output = run_command(service.status_command)
+    programs_output = None
+    if service.programs_command is not None:
+        _, programs_output = run_command(service.programs_command)
+    detail = build_service_detail(service, status_output, programs_output)
+    return ServiceStatus(
+        key=service.key,
+        group=service.group,
+        title=service.title,
+        subtitle=service.subtitle,
+        state=parse_service_state(service, status_output),
+        detail=detail,
+        programs=build_programs(service, status_output, programs_output),
+    )
+
+
+def get_all_statuses() -> list[ServiceStatus]:
+    global SERVICE_STATUS_CACHE
+
+    now_monotonic = time.monotonic()
+    with SERVICE_STATUS_CACHE_LOCK:
+        if (
+            SERVICE_STATUS_CACHE is not None
+            and now_monotonic - SERVICE_STATUS_CACHE[0] < SERVICE_STATUS_CACHE_TTL_SEC
+        ):
+            return list(SERVICE_STATUS_CACHE[1])
+
+    workers = min(6, len(SERVICES) + 1)
+    ordered_results: dict[str, ServiceStatus] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(build_server_manager_status): "server_manager",
+        }
+        for service in SERVICES:
+            future_map[executor.submit(collect_service_status, service)] = service.key
+
+        for future, key in future_map.items():
+            ordered_results[key] = future.result()
+
+    results = [ordered_results["server_manager"]]
+    for service in SERVICES:
+        results.append(ordered_results[service.key])
+
+    with SERVICE_STATUS_CACHE_LOCK:
+        SERVICE_STATUS_CACHE = (time.monotonic(), list(results))
+
     return results
+
+
+def invalidate_dashboard_caches() -> None:
+    global SERVER_MANAGER_CACHE
+    global SERVICE_STATUS_CACHE
+    global REGIME_CACHE
+
+    with SERVER_MANAGER_CACHE_LOCK:
+        SERVER_MANAGER_CACHE = None
+    with SERVICE_STATUS_CACHE_LOCK:
+        SERVICE_STATUS_CACHE = None
+    with REGIME_CACHE_LOCK:
+        REGIME_CACHE = None
+
+
+def prewarm_dashboard_caches() -> None:
+    try:
+        get_all_statuses()
+        now = datetime.now()
+        load_auto_coin_monthly_pnl(now.year, now.month)
+        load_short_regime_entries()
+    except Exception as exc:
+        append_server_log(f"대시보드 캐시 예열 실패: {exc}")
 
 
 def find_service(service_key: str) -> ServiceSpec | None:
@@ -1512,27 +2269,7 @@ def find_tool_action(service_key: str, tool_key: str) -> ToolAction | None:
     return None
 
 
-def load_short_regime_entries() -> list[RegimeEntry]:
-    command = CommandSpec(
-        cwd=AUTO_COIN_ROOT,
-        argv=[
-            str(AUTO_COIN_ROOT / ".venv/bin/python"),
-            "-m",
-            "reporting.current_regime_snapshot",
-            "--print-only",
-        ],
-    )
-    success, output = run_command(command)
-    if not success:
-        append_server_log(f"단타 레짐 스냅샷 실행 실패: {output[:300]}")
-        return []
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as exc:
-        append_server_log(f"단타 레짐 스냅샷 파싱 실패: {exc}")
-        return []
-    rows = payload.get("rows", []) if isinstance(payload, dict) else []
-
+def _build_regime_entries_from_rows(rows: list[object]) -> list[RegimeEntry]:
     def sort_key(item: RegimeEntry) -> tuple[int, int, str]:
         exchange_order = 0 if item.exchange == "UPBIT" else 1
         symbol_order = 0 if item.symbol.startswith("BTC/") else 1
@@ -1540,6 +2277,8 @@ def load_short_regime_entries() -> list[RegimeEntry]:
 
     entries: list[RegimeEntry] = []
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         exchange = str(row.get("exchange", "")).strip().upper()
         symbol = str(row.get("symbol", "")).strip()
         regime = str(row.get("regime", "")).strip()
@@ -1580,6 +2319,66 @@ def load_short_regime_entries() -> list[RegimeEntry]:
         )
 
     entries.sort(key=sort_key)
+    return entries
+
+
+def load_short_regime_entries() -> list[RegimeEntry]:
+    global REGIME_CACHE
+
+    now_monotonic = time.monotonic()
+    with REGIME_CACHE_LOCK:
+        if REGIME_CACHE is not None and now_monotonic - REGIME_CACHE[0] < REGIME_CACHE_TTL_SEC:
+            return list(REGIME_CACHE[1])
+
+    if REGIME_CACHE_PATH.exists():
+        try:
+            payload = json.loads(REGIME_CACHE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            saved_at = safe_float(payload.get("saved_at"))
+            if saved_at is not None and time.time() - saved_at < REGIME_CACHE_TTL_SEC:
+                entries = _build_regime_entries_from_rows(payload.get("rows", []))
+                with REGIME_CACHE_LOCK:
+                    REGIME_CACHE = (time.monotonic(), list(entries))
+                return entries
+
+    command = CommandSpec(
+        cwd=AUTO_COIN_ROOT,
+        argv=[
+            str(AUTO_COIN_ROOT / ".venv/bin/python"),
+            "-m",
+            "reporting.current_regime_snapshot",
+            "--print-only",
+        ],
+    )
+    success, output = run_command(command)
+    if not success:
+        append_server_log(f"단타 레짐 스냅샷 실행 실패: {output[:300]}")
+        if REGIME_CACHE_PATH.exists():
+            try:
+                payload = json.loads(REGIME_CACHE_PATH.read_text(encoding="utf-8"))
+                return _build_regime_entries_from_rows(payload.get("rows", []))
+            except (OSError, json.JSONDecodeError, AttributeError):
+                return []
+        return []
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        append_server_log(f"단타 레짐 스냅샷 파싱 실패: {exc}")
+        return []
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    entries = _build_regime_entries_from_rows(rows)
+    try:
+        REGIME_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REGIME_CACHE_PATH.write_text(
+            json.dumps({"saved_at": time.time(), "rows": rows}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    with REGIME_CACHE_LOCK:
+        REGIME_CACHE = (time.monotonic(), list(entries))
     return entries
 
 
@@ -1684,41 +2483,46 @@ def render_short_regime_page(entries: list[RegimeEntry]) -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1f7a49">
+  <meta name="theme-color" content="#0b0b0f">
   <title>현재 레짐 상세</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     :root {{
-      --bg: #efe7dc;
-      --card: #fbf8f3;
-      --text: #1f1a17;
-      --muted: #625b53;
-      --line: #ddd2c2;
+      --bg-dark: #020204;
+      --bg-light: #f5f5f7;
+      --card: rgba(255, 255, 255, 0.96);
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --line: rgba(29, 29, 31, 0.08);
       --green: #1f7a49;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: radial-gradient(circle at top left, #f5eee5 0%, var(--bg) 45%, #eadfcf 100%);
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.18), transparent 24%),
+        linear-gradient(180deg, var(--bg-dark) 0%, #101114 24%, var(--bg-light) 24.1%, var(--bg-light) 100%);
       color: var(--text);
     }}
     .wrap {{
       max-width: 1320px;
       margin: 0 auto;
-      padding: 28px 20px 40px;
+      padding: 28px 20px 48px;
     }}
     .card {{
       background: var(--card);
-      border-radius: 20px;
-      padding: 22px;
-      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+      border-radius: 28px;
+      padding: 26px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.78);
     }}
     h1 {{
       margin: 0;
-      font-size: 30px;
-      letter-spacing: -0.03em;
+      font-size: clamp(32px, 5vw, 46px);
+      letter-spacing: -0.04em;
+      line-height: 1.06;
     }}
     .meta {{
       margin: 8px 0 18px;
@@ -1733,26 +2537,27 @@ def render_short_regime_page(entries: list[RegimeEntry]) -> bytes:
       margin-bottom: 18px;
     }}
     a {{
-      border-radius: 12px;
-      padding: 10px 14px;
+      border-radius: 999px;
+      padding: 10px 16px;
       font-size: 14px;
-      font-weight: 700;
+      font-weight: 600;
       text-decoration: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
     }}
     .ghost {{
-      background: #e6dccf;
-      color: #2f2a25;
+      background: rgba(29, 29, 31, 0.05);
+      color: var(--text);
+      border: 1px solid rgba(29, 29, 31, 0.08);
     }}
     table {{
       width: 100%;
       border-collapse: collapse;
       font-size: 14px;
-      background: #f7f0e6;
+      background: #f8f8fb;
       border: 1px solid var(--line);
-      border-radius: 16px;
+      border-radius: 22px;
       overflow: hidden;
     }}
     th, td {{
@@ -1763,7 +2568,7 @@ def render_short_regime_page(entries: list[RegimeEntry]) -> bytes:
       line-height: 1.55;
     }}
     th {{
-      background: #efe4d5;
+      background: rgba(29, 29, 31, 0.04);
       font-size: 13px;
     }}
     .regime-badge {{
@@ -1892,13 +2697,16 @@ def apply_program_state(service_key: str, program_key: str, turn_on: bool) -> st
 def run_batch_program(program_key: str) -> str:
     service = find_service("batch_bot")
     title = program_title_map("batch_bot").get(program_key, program_key)
+    config_path = Path("/Users/plo/Documents/batchBot/config/managed_jobs.toml")
     command = CommandSpec(
         cwd=Path("/Users/plo/Documents/batchBot"),
         argv=[
             "python3",
             "batch_manager.py",
             "--source",
-            "codex",
+            "jobs",
+            "--config",
+            str(config_path),
             "run-job",
             program_key,
         ],
@@ -1984,6 +2792,15 @@ def run_tool_action(service_key: str, tool_key: str) -> tuple[str, str | None]:
     message = f"{service.title} / {tool.label} 실행을 요청했습니다.{suffix}"
 
     redirect_to: str | None = None
+    if service_key == "auto_stock_bot" and tool_key == "ipo_schedule_check":
+        save_tool_result(IPO_TOOL_RESULT_PATH, output)
+        if success:
+            redirect_to = "/tool-output/ipo-schedule"
+            message = f"{service.title} / {tool.label} 결과를 아래 화면에서 확인할 수 있습니다."
+        else:
+            redirect_to = "/tool-output/ipo-schedule"
+            message = f"{service.title} / {tool.label} 실행이 실패했습니다."
+
     if service_key == "auto_coin_bot" and tool_key == "weekly_backtest_report":
         latest = find_latest_batch_summary_md()
         if success and latest is not None:
@@ -2082,12 +2899,26 @@ def state_badge(state: str) -> tuple[str, str]:
     return mapping.get(state, ("확인 필요", "error"))
 
 
-def render_page(message: str = "") -> bytes:
+def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
     statuses = get_all_statuses()
     summary_text, desired = overall_state_label(statuses)
     checked = "checked" if desired is not False else ""
+    selected_pnl_year, selected_pnl_month = parse_pnl_month(pnl_month)
+    selected_pnl_month_key = f"{selected_pnl_year:04d}-{selected_pnl_month:02d}"
+    refresh_href = "/?" + urlencode({"pnl_month": selected_pnl_month_key})
+    pnl_month_hidden = f'<input type="hidden" name="pnl_month" value="{selected_pnl_month_key}">'
+    total_services = len(statuses)
+    active_services = sum(1 for item in statuses if item.state != "stopped")
+    total_programs = sum(len(item.programs) for item in statuses)
+    active_programs = sum(
+        sum(1 for program in item.programs if program.state != "stopped")
+        for item in statuses
+    )
+    total_tools = sum(len(SERVICE_TOOLS.get(item.key, [])) for item in statuses)
 
     def iter_program_sections(item: ServiceStatus) -> list[tuple[str | None, list[ProgramStatus]]]:
+        if item.key == "server_manager":
+            return [("서버 상태", item.programs)]
         if item.key == "auto_coin_bot":
             order = [
                 ("업비트", ["upbit_btc", "upbit", "upbit_stream"]),
@@ -2170,7 +3001,7 @@ def render_page(message: str = "") -> bytes:
         badge_text, badge_class = state_badge(program.state)
         program_checked = "checked" if program.state != "stopped" else ""
         program_state_text = "켜짐" if program.state != "stopped" else "꺼짐"
-        show_program_detail = item.key == "batch_bot"
+        show_program_detail = item.key in {"batch_bot", "server_manager"}
         program_controls = ""
         manual_action = ""
         if program.controllable and program.target_key:
@@ -2179,6 +3010,7 @@ def render_page(message: str = "") -> bytes:
               <form class="program-actions" method="post" action="/apply-program">
                 <input type="hidden" name="service_key" value="{html.escape(item.key)}">
                 <input type="hidden" name="program_key" value="{html.escape(program.target_key)}">
+                {pnl_month_hidden}
                 <div class="mini-switch-wrap program-switch-wrap">
                   <span>프로그램</span>
                   <label class="switch micro-switch">
@@ -2201,6 +3033,7 @@ def render_page(message: str = "") -> bytes:
             manual_action = f"""
               <form class="program-manual-form" method="post" action="/run-batch-job">
                 <input type="hidden" name="program_key" value="{html.escape(program.target_key)}">
+                {pnl_month_hidden}
                 <button type="submit" class="manual-button">수동 실행</button>
               </form>
             """
@@ -2262,10 +3095,14 @@ def render_page(message: str = "") -> bytes:
                 )
 
         card_classes = "card wide" if len(item.programs) >= 4 else "card"
+        if item.key == "remote_manager":
+            card_classes += " wide"
         if item.key == "auto_coin_bot":
-            card_classes += " short-card"
+            card_classes += " short-card auto-coin-card"
         if item.group == "manage":
             card_classes += " manage-card"
+        if item.key == "remote_manager":
+            card_classes += " remote-manager-card"
         tool_blocks = []
         for tool in SERVICE_TOOLS.get(item.key, []):
             tool_blocks.append(
@@ -2278,6 +3115,7 @@ def render_page(message: str = "") -> bytes:
                   <form method="post" action="/run-tool">
                     <input type="hidden" name="service_key" value="{html.escape(item.key)}">
                     <input type="hidden" name="tool_key" value="{html.escape(tool.key)}">
+                    {pnl_month_hidden}
                     <button type="submit" class="manual-button">실행</button>
                     </form>
                 </li>
@@ -2364,6 +3202,44 @@ def render_page(message: str = "") -> bytes:
                     '</div>'
                     '</section>'
                 )
+        pnl_section = (
+            render_auto_coin_pnl_calendar(selected_pnl_year, selected_pnl_month)
+            if item.key == "auto_coin_bot"
+            else ""
+        )
+        if item.key == "server_manager":
+            service_actions_html = """
+                <div class="service-actions service-actions-static">
+                  <div class="mini-switch-wrap static-service-label">
+                    <span>현재 서버 상태</span>
+                    <span class="mini-state-text always-on">로컬 서버</span>
+                  </div>
+                  <a class="ghost tool-link-button" href="/">새로고침</a>
+                </div>
+            """
+        else:
+            service_actions_html = f"""
+                <form class="service-actions" method="post" action="/apply-service">
+                  <input type="hidden" name="service_key" value="{html.escape(item.key)}">
+                  {pnl_month_hidden}
+                  <div class="mini-switch-wrap">
+                    <span>일괄 제어</span>
+                    <label class="switch mini-switch">
+                      <input
+                        type="checkbox"
+                        class="service-toggle"
+                        name="desired_state"
+                        value="on"
+                        data-state-label="state-label-{html.escape(item.key)}"
+                        {item_checked}
+                      >
+                      <span class="slider"></span>
+                    </label>
+                    <span class="mini-state-text" id="state-label-{html.escape(item.key)}">{item_state_text}</span>
+                  </div>
+                  <button type="submit" class="mini-button">일괄 적용</button>
+                </form>
+            """
         return f"""
             <section class="{card_classes}" data-service-key="{html.escape(item.key)}" draggable="true">
               <div class="row">
@@ -2385,26 +3261,9 @@ def render_page(message: str = "") -> bytes:
                 </div>
               </div>
               <div class="card-body" id="{body_id}">
-                <form class="service-actions" method="post" action="/apply-service">
-                  <input type="hidden" name="service_key" value="{html.escape(item.key)}">
-                  <div class="mini-switch-wrap">
-                    <span>일괄 제어</span>
-                    <label class="switch mini-switch">
-                      <input
-                        type="checkbox"
-                        class="service-toggle"
-                        name="desired_state"
-                        value="on"
-                        data-state-label="state-label-{html.escape(item.key)}"
-                        {item_checked}
-                      >
-                      <span class="slider"></span>
-                    </label>
-                    <span class="mini-state-text" id="state-label-{html.escape(item.key)}">{item_state_text}</span>
-                  </div>
-                  <button type="submit" class="mini-button">일괄 적용</button>
-                </form>
+                {service_actions_html}
                 <div class="service-detail">{html.escape(item.detail)}</div>
+                {pnl_section}
                 {regime_section}
                 <div class="program-sections">
                   {''.join(section_blocks) or '<div class="program-empty">세부 프로그램 정보가 없습니다.</div>'}
@@ -2415,9 +3274,19 @@ def render_page(message: str = "") -> bytes:
             """
 
     group_titles = {
-        "coin": "코인",
-        "stock": "주식",
-        "manage": "관리",
+        "coin": "코인₿",
+        "stock": "주식📈",
+        "manage": "관리🤖",
+    }
+    group_eyebrows = {
+        "coin": "Digital Assets",
+        "stock": "Equities",
+        "manage": "Operations",
+    }
+    group_descriptions = {
+        "coin": "실행 중인 코인 전략과 분석 보조 프로그램을 한 번에 보고 제어합니다.",
+        "stock": "주식 자동매매와 수집·감시 흐름을 낮은 밀도의 카드 구조로 정리합니다.",
+        "manage": "원격 제어, 배치, 운영 보조 기능을 별도 레이어로 분리해 관리합니다.",
     }
     group_order = ["coin", "stock", "manage"]
     sections: list[str] = []
@@ -2429,7 +3298,11 @@ def render_page(message: str = "") -> bytes:
             f"""
             <section class="group-block">
               <div class="group-header">
-                <h2>{html.escape(group_titles[group])}</h2>
+                <div class="group-copy">
+                  <span class="group-kicker">{html.escape(group_eyebrows[group])}</span>
+                  <h2>{html.escape(group_titles[group])}</h2>
+                  <p class="group-description">{html.escape(group_descriptions[group])}</p>
+                </div>
                 <p class="group-help">카드는 드래그로 순서를 바꾸고, 숨기기 버튼으로 접을 수 있습니다.</p>
               </div>
               <div class="grid" data-group-key="{html.escape(group)}">
@@ -2440,67 +3313,221 @@ def render_page(message: str = "") -> bytes:
         )
 
     flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
+    hero_stats = [
+        ("서비스", f"{active_services}/{total_services}", "실행중인 서비스"),
+        ("프로그램", f"{active_programs}/{total_programs}", "실행중인 프로그램"),
+        ("도구", str(total_tools), "실행가능 도구"),
+    ]
+    hero_stats_html = "".join(
+        f"""
+        <div class="hero-stat">
+          <span class="hero-stat-label">{html.escape(label)}</span>
+          <strong class="hero-stat-value">{html.escape(value)}</strong>
+          <span class="hero-stat-detail">{html.escape(detail)}</span>
+        </div>
+        """
+        for label, value, detail in hero_stats
+    )
     page = f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1f7a49">
+  <meta name="theme-color" content="#0b0b0f">
   <title>Process Control Center</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     :root {{
-      --bg: #efe7dc;
-      --card: #fbf8f3;
-      --text: #1f1a17;
-      --muted: #625b53;
-      --line: #ddd2c2;
-      --green: #26a65b;
-      --green-soft: #dff2e7;
-      --gray: #7c7771;
-      --gray-soft: #e8e0d7;
-      --amber: #946200;
-      --amber-soft: #f4e5bb;
-      --red: #9f2f2f;
-      --red-soft: #f1d9d9;
+      --bg-dark: #000000;
+      --bg-light: #f5f5f7;
+      --surface: rgba(255, 255, 255, 0.82);
+      --surface-strong: #ffffff;
+      --surface-soft: #fbfbfd;
+      --surface-dark: rgba(20, 20, 24, 0.72);
+      --text: #1d1d1f;
+      --text-light: #f5f5f7;
+      --muted: #6e6e73;
+      --muted-light: rgba(245, 245, 247, 0.72);
+      --line: rgba(29, 29, 31, 0.08);
+      --line-strong: rgba(255, 255, 255, 0.12);
+      --blue: #0071e3;
+      --blue-soft: rgba(0, 113, 227, 0.12);
+      --blue-dark: #2997ff;
+      --green: #1e9b55;
+      --green-soft: rgba(30, 155, 85, 0.14);
+      --gray: #6e6e73;
+      --gray-soft: rgba(110, 110, 115, 0.12);
+      --amber: #a46b00;
+      --amber-soft: rgba(164, 107, 0, 0.14);
+      --red: #c93434;
+      --red-soft: rgba(201, 52, 52, 0.14);
+      --radius-card: 28px;
+      --radius-pill: 999px;
+      --shadow-soft: 0 22px 60px rgba(0, 0, 0, 0.10);
+      --shadow-strong: 0 30px 80px rgba(0, 0, 0, 0.22);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: radial-gradient(circle at top left, #f5eee5 0%, var(--bg) 45%, #eadfcf 100%);
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.14), transparent 30%),
+        radial-gradient(circle at 12% 8%, rgba(255, 255, 255, 0.75), transparent 18%),
+        linear-gradient(180deg, #eef3f8 0%, #f3f5f8 38%, #f5f5f7 70%, #f7f7f9 100%);
       color: var(--text);
     }}
     .wrap {{
-      max-width: 1320px;
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 28px 20px 40px;
+      padding: 28px 20px 56px;
+    }}
+    .hero {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.9fr);
+      gap: 24px;
+      align-items: stretch;
+      padding: 28px 0 38px;
+    }}
+    .hero-copy {{
+      padding: 28px 6px 0 0;
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 12px;
+      border-radius: var(--radius-pill);
+      border: 1px solid rgba(29, 29, 31, 0.08);
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
     }}
     h1 {{
       margin: 0;
-      font-size: 34px;
-      letter-spacing: -0.03em;
+      margin-top: 18px;
+      font-size: clamp(44px, 7vw, 72px);
+      line-height: 1.04;
+      letter-spacing: -0.05em;
+      color: var(--text);
+      max-width: 11ch;
     }}
     .lead {{
-      margin: 8px 0 0;
+      margin: 18px 0 0;
+      max-width: 560px;
       color: var(--muted);
-      font-size: 15px;
+      font-size: 19px;
+      line-height: 1.55;
+      letter-spacing: -0.01em;
     }}
-    .flash {{
-      margin-top: 18px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: #fff7d1;
-      color: #6e5a00;
+    .hero-meta {{
+      margin-top: 24px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .hero-pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      padding: 0 16px;
+      border-radius: var(--radius-pill);
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid rgba(29, 29, 31, 0.08);
+      color: var(--text);
+      font-size: 14px;
       font-weight: 600;
     }}
+    .hero-pill.hero-link {{
+      gap: 8px;
+      text-decoration: none;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
+    }}
+    .hero-link-icon {{
+      width: 15px;
+      height: 15px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 15px;
+    }}
+    .hero-link-icon svg {{
+      width: 15px;
+      height: 15px;
+      fill: currentColor;
+      display: block;
+    }}
+    .hero-pill.hero-link:hover {{
+      background: rgba(0, 113, 227, 0.10);
+      border-color: rgba(0, 113, 227, 0.18);
+      color: var(--blue);
+      transform: translateY(-1px);
+    }}
+    .hero-panel {{
+      display: grid;
+      gap: 16px;
+      padding: 24px;
+      border-radius: 30px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.04)),
+        rgba(12, 12, 16, 0.72);
+      border: 1px solid var(--line-strong);
+      box-shadow: var(--shadow-strong);
+      backdrop-filter: blur(22px);
+      -webkit-backdrop-filter: blur(22px);
+    }}
+    .flash {{
+      padding: 14px 18px;
+      border-radius: 18px;
+      background: rgba(0, 113, 227, 0.16);
+      color: #d6ebff;
+      border: 1px solid rgba(41, 151, 255, 0.24);
+      font-weight: 600;
+      line-height: 1.5;
+    }}
+    .hero-stat-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .hero-stat {{
+      padding: 18px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }}
+    .hero-stat-label {{
+      color: var(--muted-light);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }}
+    .hero-stat-value {{
+      color: var(--text-light);
+      font-size: 34px;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }}
+    .hero-stat-detail {{
+      color: var(--muted-light);
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .content-shell {{
+      margin-top: 8px;
+    }}
     .panel {{
-      margin-top: 20px;
-      background: var(--card);
-      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.98);
+      border-radius: 26px;
       padding: 22px;
-      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
     }}
     .top-row {{
       display: flex;
@@ -2522,6 +3549,7 @@ def render_page(message: str = "") -> bytes:
       align-items: center;
       gap: 12px;
       font-weight: 700;
+      color: var(--text);
     }}
     .switch {{
       position: relative;
@@ -2537,7 +3565,7 @@ def render_page(message: str = "") -> bytes:
     .slider {{
       position: absolute;
       inset: 0;
-      background: #b6b1ab;
+      background: #c7c7cc;
       transition: 0.25s;
       border-radius: 999px;
       cursor: pointer;
@@ -2555,14 +3583,14 @@ def render_page(message: str = "") -> bytes:
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
     }}
     input:checked + .slider {{
-      background: var(--green);
+      background: var(--blue);
     }}
     input:checked + .slider:before {{
       transform: translateX(34px);
     }}
     .state-text {{
       font-size: 18px;
-      color: var(--green);
+      color: var(--blue);
       min-width: 48px;
     }}
     .summary {{
@@ -2577,24 +3605,30 @@ def render_page(message: str = "") -> bytes:
       flex-wrap: wrap;
     }}
     button, .ghost {{
-      border: 0;
-      border-radius: 12px;
-      padding: 12px 16px;
+      border: 1px solid transparent;
+      border-radius: var(--radius-pill);
+      padding: 12px 18px;
       font-size: 14px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
       text-decoration: none;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
     }}
     button {{
-      background: #1f7a49;
+      background: var(--blue);
       color: white;
+      box-shadow: 0 8px 20px rgba(0, 113, 227, 0.22);
     }}
     .ghost {{
-      background: #e6dccf;
-      color: #2f2a25;
+      background: rgba(29, 29, 31, 0.05);
+      color: var(--text);
+      border-color: rgba(29, 29, 31, 0.08);
+    }}
+    button:hover, .ghost:hover {{
+      transform: translateY(-1px);
     }}
     .service-actions {{
       margin-top: 14px;
@@ -2603,6 +3637,15 @@ def render_page(message: str = "") -> bytes:
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
+    }}
+    .service-actions-static {{
+      align-items: center;
+    }}
+    .static-service-label {{
+      color: var(--text);
+    }}
+    .always-on {{
+      color: var(--blue);
     }}
     .mini-switch-wrap {{
       display: inline-flex;
@@ -2628,7 +3671,7 @@ def render_page(message: str = "") -> bytes:
     .mini-state-text {{
       min-width: 38px;
       font-size: 14px;
-      color: #1f7a49;
+      color: var(--blue);
     }}
     .mini-button {{
       padding: 10px 14px;
@@ -2673,16 +3716,16 @@ def render_page(message: str = "") -> bytes:
     .micro-state-text {{
       min-width: 32px;
       font-size: 12px;
-      color: #1f7a49;
+      color: var(--blue);
     }}
     .micro-button {{
-      border: 0;
-      border-radius: 9px;
-      padding: 8px 10px;
-      background: #d8ccb9;
-      color: #2f2a25;
+      border: 1px solid rgba(29, 29, 31, 0.08);
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: rgba(29, 29, 31, 0.04);
+      color: var(--text);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
       white-space: nowrap;
       justify-self: end;
@@ -2694,12 +3737,12 @@ def render_page(message: str = "") -> bytes:
     }}
     .manual-button {{
       border: 0;
-      border-radius: 10px;
-      padding: 8px 12px;
-      background: #1f7a49;
+      border-radius: 999px;
+      padding: 9px 14px;
+      background: var(--blue);
       color: white;
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
       white-space: nowrap;
     }}
@@ -2716,34 +3759,54 @@ def render_page(message: str = "") -> bytes:
       grid-column: auto;
     }}
     .group-block {{
-      margin-top: 22px;
+      margin-top: 30px;
     }}
     .group-header {{
       display: flex;
-      align-items: center;
+      align-items: flex-end;
       justify-content: space-between;
-      gap: 12px;
+      gap: 20px;
       flex-wrap: wrap;
-      margin-bottom: 12px;
+      margin-bottom: 16px;
+    }}
+    .group-copy {{
+      display: grid;
+      gap: 8px;
+    }}
+    .group-kicker {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }}
     .group-help {{
       margin: 0;
       color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
+    }}
+    .group-description {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.55;
+      max-width: 56ch;
     }}
     h2 {{
       margin: 0;
-      font-size: 22px;
-      letter-spacing: -0.02em;
+      font-size: 40px;
+      line-height: 1.1;
+      letter-spacing: -0.04em;
     }}
     .card {{
-      background: var(--card);
-      border-radius: 18px;
-      padding: 18px;
-      box-shadow: 0 10px 30px rgba(48, 35, 18, 0.08);
+      background: linear-gradient(180deg, var(--surface-strong), var(--surface-soft));
+      border-radius: var(--radius-card);
+      padding: 22px;
+      box-shadow: var(--shadow-soft);
+      border: 1px solid rgba(255, 255, 255, 0.72);
       min-width: 0;
       display: grid;
-      gap: 14px;
+      gap: 18px;
     }}
     .card.wide {{
       grid-column: span 2;
@@ -2756,7 +3819,7 @@ def render_page(message: str = "") -> bytes:
     }}
     .card.dragging {{
       opacity: 0.45;
-      border: 2px dashed #b89e78;
+      border: 1px dashed rgba(0, 113, 227, 0.4);
     }}
     .card-header-actions {{
       display: flex;
@@ -2765,10 +3828,16 @@ def render_page(message: str = "") -> bytes:
       gap: 8px;
       flex-wrap: wrap;
     }}
+    .remote-manager-card .card-header-actions {{
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }}
+    .remote-manager-card .drag-handle {{
+      min-width: auto;
+    }}
     .tool-button {{
-      padding: 8px 12px;
+      padding: 9px 14px;
       font-size: 12px;
-      background: #efe4d5;
     }}
     .drag-handle {{
       display: inline-flex;
@@ -2776,13 +3845,14 @@ def render_page(message: str = "") -> bytes:
       justify-content: center;
       min-width: 44px;
       padding: 8px 10px;
-      border-radius: 10px;
-      background: #eadcca;
-      color: #4f483f;
+      border-radius: 999px;
+      background: rgba(29, 29, 31, 0.06);
+      color: var(--muted);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: grab;
       user-select: none;
+      border: 1px solid rgba(29, 29, 31, 0.08);
     }}
     .row {{
       display: flex;
@@ -2792,19 +3862,20 @@ def render_page(message: str = "") -> bytes:
     }}
     h3 {{
       margin: 0;
-      font-size: 18px;
+      font-size: 28px;
+      letter-spacing: -0.03em;
     }}
     .subtitle {{
       margin: 6px 0 0;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 14px;
     }}
     .badge {{
       white-space: nowrap;
       border-radius: 999px;
-      padding: 8px 12px;
+      padding: 8px 13px;
       font-size: 12px;
-      font-weight: 800;
+      font-weight: 700;
     }}
     .badge.small {{
       padding: 6px 10px;
@@ -2819,24 +3890,25 @@ def render_page(message: str = "") -> bytes:
     .badge.failed {{ background: var(--red-soft); color: var(--red); }}
     .service-detail {{
       white-space: pre-wrap;
-      background: #f3ede4;
-      border-radius: 12px;
-      padding: 12px;
-      color: #3f3a34;
+      background: rgba(29, 29, 31, 0.03);
+      border-radius: 20px;
+      padding: 16px 18px;
+      color: #3a3a3c;
       font-size: 14px;
-      line-height: 1.5;
+      line-height: 1.6;
+      border: 1px solid rgba(29, 29, 31, 0.06);
     }}
     .program-sections {{
       display: grid;
-      gap: 12px;
+      gap: 14px;
     }}
     .program-group {{
       display: grid;
       gap: 10px;
       border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #f7f0e6;
-      padding: 10px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      padding: 14px;
     }}
     .program-group-header {{
       display: flex;
@@ -2848,8 +3920,8 @@ def render_page(message: str = "") -> bytes:
     .program-group h4 {{
       margin: 0;
       font-size: 14px;
-      font-weight: 800;
-      color: #473f38;
+      font-weight: 700;
+      color: var(--text);
     }}
     .program-group-body {{
       display: block;
@@ -2873,9 +3945,9 @@ def render_page(message: str = "") -> bytes:
     .program-row,
     .program-empty {{
       border: 1px solid var(--line);
-      border-radius: 14px;
-      background: #f8f2e9;
-      padding: 12px;
+      border-radius: 18px;
+      background: rgba(245, 245, 247, 0.92);
+      padding: 14px;
     }}
     .program-header {{
       display: flex;
@@ -2901,9 +3973,9 @@ def render_page(message: str = "") -> bytes:
     }}
     .regime-box {{
       border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #f7f0e6;
-      padding: 12px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      padding: 14px;
       display: grid;
       gap: 10px;
     }}
@@ -2917,16 +3989,16 @@ def render_page(message: str = "") -> bytes:
     .regime-box h4 {{
       margin: 0;
       font-size: 14px;
-      font-weight: 800;
-      color: #473f38;
+      font-weight: 700;
+      color: var(--text);
     }}
     .regime-box-body.is-collapsed {{
       display: none;
     }}
     .regime-board {{
       border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #fbf6ef;
+      border-radius: 18px;
+      background: rgba(245, 245, 247, 0.92);
       padding: 8px;
       overflow: hidden;
     }}
@@ -2954,11 +4026,11 @@ def render_page(message: str = "") -> bytes:
     .regime-stage {{
       min-width: 0;
       border: 1px solid var(--line);
-      border-radius: 10px;
+      border-radius: 14px;
       padding: 8px 8px;
       display: grid;
       gap: 4px;
-      background: #fbf6ef;
+      background: rgba(255, 255, 255, 0.88);
     }}
     .regime-stage-head {{
       display: grid;
@@ -2989,7 +4061,7 @@ def render_page(message: str = "") -> bytes:
       flex: 0 0 12px;
       font-size: 11px;
       font-weight: 800;
-      color: #8d806d;
+      color: #8e8e93;
     }}
     .regime-board-compact .regime-flow.regime-flow-horizontal {{
       gap: 6px;
@@ -3027,6 +4099,162 @@ def render_page(message: str = "") -> bytes:
     .regime-exhaustion {{ background: #f5dfc1; color: #8d5600; }}
     .regime-overheated {{ background: #f1d9d9; color: #9f2f2f; }}
     .regime-unknown {{ background: #e6dccf; color: #2f2a25; }}
+    .pnl-box {{
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+    }}
+    .pnl-box-header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .pnl-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .pnl-nav {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .pnl-month-label {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: rgba(29, 29, 31, 0.04);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .pnl-calendar-body.is-collapsed {{
+      display: none;
+    }}
+    .pnl-box h4 {{
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .pnl-caption {{
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .pnl-summary {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .pnl-summary-chip,
+    .pnl-summary-meta {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 0 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .pnl-summary-chip.positive,
+    .pnl-value.positive {{
+      background: rgba(30, 155, 85, 0.12);
+      color: var(--green);
+    }}
+    .pnl-summary-chip.negative,
+    .pnl-value.negative {{
+      background: rgba(201, 52, 52, 0.12);
+      color: var(--red);
+    }}
+    .pnl-summary-chip.flat,
+    .pnl-value.flat {{
+      background: rgba(29, 29, 31, 0.06);
+      color: var(--muted);
+    }}
+    .pnl-summary-meta {{
+      background: rgba(29, 29, 31, 0.04);
+      color: var(--muted);
+    }}
+    .pnl-calendar {{
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 8px;
+    }}
+    .pnl-weekday {{
+      padding: 0 2px 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      text-align: right;
+    }}
+    .pnl-day {{
+      min-height: 110px;
+      border-radius: 18px;
+      border: 1px solid rgba(29, 29, 31, 0.06);
+      background: rgba(245, 245, 247, 0.94);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }}
+    .pnl-day.positive {{
+      background: rgba(232, 246, 237, 0.98);
+    }}
+    .pnl-day.negative {{
+      background: rgba(250, 235, 235, 0.98);
+    }}
+    .pnl-day.flat {{
+      background: rgba(245, 245, 247, 0.94);
+    }}
+    .pnl-day.is-today {{
+      box-shadow: inset 0 0 0 2px rgba(0, 113, 227, 0.22);
+    }}
+    .pnl-day.is-empty {{
+      background: transparent;
+      border-style: dashed;
+      border-color: rgba(29, 29, 31, 0.04);
+    }}
+    .pnl-day-head {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+    }}
+    .pnl-day-number {{
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .pnl-day-values {{
+      display: grid;
+      gap: 6px;
+    }}
+    .pnl-value {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: fit-content;
+      max-width: 100%;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.3;
+      word-break: break-word;
+    }}
     .manage-card .program-sections {{
       grid-template-columns: minmax(0, 1fr);
     }}
@@ -3035,9 +4263,9 @@ def render_page(message: str = "") -> bytes:
     }}
     .tool-box {{
       border: 1px solid var(--line);
-      border-radius: 16px;
-      background: #f7f0e6;
-      padding: 12px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      padding: 14px;
       display: grid;
       gap: 10px;
     }}
@@ -3051,8 +4279,8 @@ def render_page(message: str = "") -> bytes:
     .tool-box h4 {{
       margin: 0;
       font-size: 14px;
-      font-weight: 800;
-      color: #473f38;
+      font-weight: 700;
+      color: var(--text);
     }}
     .tool-box-body.is-collapsed {{
       display: none;
@@ -3070,9 +4298,9 @@ def render_page(message: str = "") -> bytes:
       gap: 10px;
       align-items: center;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #fbf6ef;
-      padding: 10px 12px;
+      border-radius: 18px;
+      background: rgba(245, 245, 247, 0.92);
+      padding: 12px 14px;
     }}
     .tool-row-stack {{
       grid-template-columns: minmax(0, 1fr);
@@ -3080,8 +4308,8 @@ def render_page(message: str = "") -> bytes:
     }}
     .tool-label {{
       font-size: 13px;
-      font-weight: 700;
-      color: #3f3a34;
+      font-weight: 600;
+      color: var(--text);
       display: block;
       min-width: 0;
     }}
@@ -3146,12 +4374,12 @@ def render_page(message: str = "") -> bytes:
       gap: 10px;
       align-items: center;
       border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #f3eadf;
-      padding: 10px 12px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.84);
+      padding: 12px 14px;
     }}
     .tool-link-button {{
-      padding: 8px 12px;
+      padding: 9px 14px;
       font-size: 12px;
       font-weight: 700;
     }}
@@ -3159,8 +4387,21 @@ def render_page(message: str = "") -> bytes:
       .wrap {{
         padding: 22px 14px 32px;
       }}
+      .hero {{
+        grid-template-columns: minmax(0, 1fr);
+        padding-top: 16px;
+      }}
+      .hero-copy {{
+        padding-top: 12px;
+      }}
       h1 {{
-        font-size: 28px;
+        font-size: 42px;
+      }}
+      h2 {{
+        font-size: 30px;
+      }}
+      .hero-stat-grid {{
+        grid-template-columns: minmax(0, 1fr);
       }}
       .panel,
       .card {{
@@ -3185,6 +4426,24 @@ def render_page(message: str = "") -> bytes:
       }}
       .program-actions {{
         grid-template-columns: minmax(0, 1fr);
+      }}
+      .remote-manager-card .card-header-actions {{
+        flex-wrap: wrap;
+      }}
+      .pnl-calendar {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .pnl-weekday {{
+        display: none;
+      }}
+      .pnl-day {{
+        min-height: 88px;
+      }}
+      .pnl-toolbar {{
+        align-items: stretch;
+      }}
+      .pnl-nav {{
+        width: 100%;
       }}
       .tool-row {{
         grid-template-columns: minmax(0, 1fr);
@@ -3234,29 +4493,63 @@ def render_page(message: str = "") -> bytes:
 </head>
 <body>
   <div class="wrap">
-    <h1>Process Control Center</h1>
-    <p class="lead">브라우저에서 켜짐/꺼짐 토글을 바꾸고 적용하면 전체 프로세스를 일괄 제어합니다.</p>
-    {flash}
-    <section class="panel">
-      <form method="post" action="/apply">
-        <div class="top-row">
-          <div class="switch-wrap">
-            <span>희망 상태</span>
-            <label class="switch">
-              <input type="checkbox" id="desiredToggle" name="desired_state" value="on" {checked}>
-              <span class="slider"></span>
-            </label>
-            <span class="state-text" id="desiredStateText">{'켜짐' if checked else '꺼짐'}</span>
-          </div>
-          <div class="top-actions">
-            <button type="submit">적용</button>
-            <a class="ghost" href="/">새로고침</a>
-          </div>
+    <section class="hero">
+      <div class="hero-copy">
+        <span class="eyebrow">Remote Control</span>
+        <h1>원격 프로그램 관리 대시보드</h1>
+        <p class="lead">딸깍으로 영앤리치 되기 프로젝트</p>
+        <div class="hero-meta">
+          <span class="hero-pill">김지현</span>
+          <span class="hero-pill">jhny</span>
+          <span class="hero-pill">자동매매</span>
+          <a class="hero-pill hero-link" href="https://github.com/jhny-kor" target="_blank" rel="noopener">
+            <span class="hero-link-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12 2C6.477 2 2 6.596 2 12.267c0 4.537 2.865 8.387 6.839 9.746.5.095.682-.221.682-.492 0-.244-.009-.889-.014-1.744-2.782.615-3.369-1.37-3.369-1.37-.455-1.173-1.11-1.485-1.11-1.485-.908-.636.069-.623.069-.623 1.004.072 1.532 1.051 1.532 1.051.892 1.566 2.341 1.114 2.91.852.091-.663.349-1.114.635-1.37-2.22-.259-4.555-1.137-4.555-5.063 0-1.119.39-2.034 1.029-2.751-.103-.259-.446-1.301.098-2.712 0 0 .84-.276 2.75 1.051A9.357 9.357 0 0 1 12 6.835c.85.004 1.706.118 2.504.347 1.909-1.327 2.748-1.051 2.748-1.051.546 1.411.202 2.453.1 2.712.64.717 1.027 1.632 1.027 2.751 0 3.936-2.339 4.801-4.566 5.055.359.319.678.947.678 1.91 0 1.379-.012 2.49-.012 2.828 0 .273.18.592.688.491C19.138 20.65 22 16.802 22 12.267 22 6.596 17.523 2 12 2Z"/>
+              </svg>
+            </span>
+            <span>GitHub</span>
+          </a>
+          <a class="hero-pill hero-link" href="https://www.instagram.com/_k.jhny" target="_blank" rel="noopener">
+            <span class="hero-link-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M7.75 2h8.5A5.75 5.75 0 0 1 22 7.75v8.5A5.75 5.75 0 0 1 16.25 22h-8.5A5.75 5.75 0 0 1 2 16.25v-8.5A5.75 5.75 0 0 1 7.75 2Zm0 1.8A3.95 3.95 0 0 0 3.8 7.75v8.5a3.95 3.95 0 0 0 3.95 3.95h8.5a3.95 3.95 0 0 0 3.95-3.95v-8.5a3.95 3.95 0 0 0-3.95-3.95h-8.5Zm8.95 1.35a1.1 1.1 0 1 1 0 2.2 1.1 1.1 0 0 1 0-2.2ZM12 6.85A5.15 5.15 0 1 1 6.85 12 5.16 5.16 0 0 1 12 6.85Zm0 1.8A3.35 3.35 0 1 0 15.35 12 3.35 3.35 0 0 0 12 8.65Z"/>
+              </svg>
+            </span>
+            <span>Instagram</span>
+          </a>
         </div>
-        <div class="summary">{html.escape(summary_text)}</div>
-      </form>
+      </div>
+      <div class="hero-panel">
+        {flash}
+        <div class="hero-stat-grid">
+          {hero_stats_html}
+        </div>
+        <section class="panel">
+          <form method="post" action="/apply">
+            {pnl_month_hidden}
+            <div class="top-row">
+              <div class="switch-wrap">
+                <span>희망 상태</span>
+                <label class="switch">
+                  <input type="checkbox" id="desiredToggle" name="desired_state" value="on" {checked}>
+                  <span class="slider"></span>
+                </label>
+                <span class="state-text" id="desiredStateText">{'켜짐' if checked else '꺼짐'}</span>
+              </div>
+              <div class="top-actions">
+                <button type="submit">적용</button>
+                <a class="ghost" href="{html.escape(refresh_href)}">새로고침</a>
+              </div>
+            </div>
+            <div class="summary">{html.escape(summary_text)}</div>
+          </form>
+        </section>
+      </div>
     </section>
-    {''.join(sections)}
+    <section class="content-shell">
+      {''.join(sections)}
+    </section>
   </div>
   <script>
     const CARD_ORDER_KEY = 'process-control-card-order-v1';
@@ -3285,7 +4578,7 @@ def render_page(message: str = "") -> bytes:
     const refreshLabel = () => {{
       const on = toggle.checked;
       text.textContent = on ? '켜짐' : '꺼짐';
-      text.style.color = on ? '#1f7a49' : '#6b6761';
+      text.style.color = on ? '#0071e3' : '#8e8e93';
     }};
     toggle.addEventListener('change', refreshLabel);
     refreshLabel();
@@ -3296,7 +4589,7 @@ def render_page(message: str = "") -> bytes:
       const refreshServiceLabel = () => {{
         const on = serviceToggle.checked;
         label.textContent = on ? '켜짐' : '꺼짐';
-        label.style.color = on ? '#1f7a49' : '#6b6761';
+        label.style.color = on ? '#0071e3' : '#8e8e93';
       }};
       serviceToggle.addEventListener('change', refreshServiceLabel);
       refreshServiceLabel();
@@ -3308,7 +4601,7 @@ def render_page(message: str = "") -> bytes:
       const refreshProgramLabel = () => {{
         const on = programToggle.checked;
         label.textContent = on ? '켜짐' : '꺼짐';
-        label.style.color = on ? '#1f7a49' : '#6b6761';
+        label.style.color = on ? '#0071e3' : '#8e8e93';
       }};
       programToggle.addEventListener('change', refreshProgramLabel);
       refreshProgramLabel();
@@ -3537,16 +4830,18 @@ def render_access_required_page() -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1f7a49">
+  <meta name="theme-color" content="#050507">
   <title>Access Required</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-      background: linear-gradient(180deg, #f5eee5 0%, #eadfcf 100%);
-      color: #2a241f;
+      font-family: "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, "Apple SD Gothic Neo", sans-serif;
+      background:
+        radial-gradient(circle at top center, rgba(41, 151, 255, 0.28), transparent 28%),
+        linear-gradient(180deg, #020204 0%, #0b0b10 100%);
+      color: #f5f5f7;
       display: grid;
       min-height: 100vh;
       place-items: center;
@@ -3555,19 +4850,24 @@ def render_access_required_page() -> bytes:
     }
     .card {
       width: min(420px, 100%);
-      background: rgba(255, 251, 246, 0.94);
-      border-radius: 22px;
-      padding: 24px;
-      box-shadow: 0 18px 40px rgba(60, 45, 25, 0.14);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.06));
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: 0 26px 80px rgba(0, 0, 0, 0.34);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
     }
     h1 {
       margin: 0 0 10px;
-      font-size: 22px;
+      font-size: 30px;
+      letter-spacing: -0.04em;
     }
     p {
       margin: 0;
       line-height: 1.6;
-      color: #655c53;
+      color: rgba(245, 245, 247, 0.72);
+      font-size: 16px;
     }
   </style>
 </head>
@@ -3586,17 +4886,17 @@ def render_favicon_svg() -> bytes:
     svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <defs>
     <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0%" stop-color="#1f7a49"/>
-      <stop offset="100%" stop-color="#26a65b"/>
+      <stop offset="0%" stop-color="#0071e3"/>
+      <stop offset="100%" stop-color="#2997ff"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="16" fill="#f4ecdf"/>
+  <rect width="64" height="64" rx="16" fill="#f5f5f7"/>
   <rect x="9" y="9" width="46" height="46" rx="12" fill="url(#g)"/>
-  <path d="M18 40 L28 31 L35 36 L46 22" fill="none" stroke="#f7f4ef" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="18" cy="40" r="3" fill="#f7f4ef"/>
-  <circle cx="28" cy="31" r="3" fill="#f7f4ef"/>
-  <circle cx="35" cy="36" r="3" fill="#f7f4ef"/>
-  <circle cx="46" cy="22" r="3" fill="#f7f4ef"/>
+  <path d="M18 40 L28 31 L35 36 L46 22" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="40" r="3" fill="#ffffff"/>
+  <circle cx="28" cy="31" r="3" fill="#ffffff"/>
+  <circle cx="35" cy="36" r="3" fill="#ffffff"/>
+  <circle cx="46" cy="22" r="3" fill="#ffffff"/>
 </svg>"""
     return svg.encode("utf-8")
 
@@ -3612,7 +4912,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if parsed.path in {"/backtest-summary", "/backtest-summary/download", "/backtest-summaries", "/regime-snapshot"}:
+        if parsed.path in {"/backtest-summary", "/backtest-summary/download", "/backtest-summaries", "/regime-snapshot", "/tool-output/ipo-schedule"}:
             authorized, grant_cookie = check_request_authorization(self)
             if not authorized:
                 self.send_error(HTTPStatus.FORBIDDEN)
@@ -3620,6 +4920,13 @@ class ControlHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             if parsed.path == "/regime-snapshot":
                 body = render_short_regime_page(load_short_regime_entries())
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            elif parsed.path == "/tool-output/ipo-schedule":
+                if IPO_TOOL_RESULT_PATH.exists():
+                    body = render_tool_text_page("공모주 일정 점검 결과", IPO_TOOL_RESULT_PATH.read_text(encoding="utf-8"))
+                else:
+                    body = render_tool_text_page("공모주 일정 점검 결과", "저장된 결과가 없습니다.")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             elif parsed.path == "/backtest-summaries":
@@ -3681,7 +4988,8 @@ class ControlHandler(BaseHTTPRequestHandler):
         if not message and "message" in query:
             message = query["message"][0]
 
-        body = render_page(message=message)
+        pnl_month = query.get("pnl_month", [""])[0]
+        body = render_page(message=message, pnl_month=pnl_month)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         if grant_cookie:
@@ -3705,6 +5013,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         form = parse_qs(raw)
 
         redirect_after_tool: str | None = None
+        pnl_month = form.get("pnl_month", [""])[0].strip()
         if parsed.path == "/apply":
             turn_on = form.get("desired_state", ["off"])[-1] == "on"
             append_server_log(f"웹 전체 제어 요청 수신: {'켜짐' if turn_on else '꺼짐'}")
@@ -3743,6 +5052,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
 
+        invalidate_dashboard_caches()
         STATE.set_message(message)
 
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -3750,6 +5060,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             location = redirect_after_tool
         else:
             location = "/"
+            if pnl_month:
+                location = location + "?" + urlencode({"pnl_month": pnl_month})
         self.send_header("Location", location)
         self.end_headers()
 
@@ -3761,6 +5073,7 @@ def serve() -> int:
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     append_server_log(f"제어 서버 시작: bind={BIND_HOST}:{PORT}")
+    threading.Thread(target=prewarm_dashboard_caches, daemon=True).start()
     server = ThreadingHTTPServer((BIND_HOST, PORT), ControlHandler)
     try:
         server.serve_forever()
