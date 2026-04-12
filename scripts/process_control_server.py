@@ -1568,6 +1568,29 @@ def render_backtest_summary_list_page(summary_paths: list[Path]) -> bytes:
     return page.encode("utf-8")
 
 
+def extract_service_card_html(page_html: str, service_key: str) -> str | None:
+    marker = f'data-service-key="{service_key}"'
+    marker_index = page_html.find(marker)
+    if marker_index < 0:
+        return None
+
+    start_index = page_html.rfind("<section", 0, marker_index)
+    if start_index < 0:
+        return None
+
+    token_re = re.compile(r"<section\b|</section>")
+    depth = 0
+    for match in token_re.finditer(page_html, start_index):
+        token = match.group(0)
+        if token.startswith("<section"):
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return page_html[start_index:match.end()]
+    return None
+
+
 def tail_server_log(limit: int = 30) -> str:
     if not SERVER_LOG_PATH.exists():
         return ""
@@ -2899,6 +2922,392 @@ def state_badge(state: str) -> tuple[str, str]:
     return mapping.get(state, ("확인 필요", "error"))
 
 
+def iter_program_sections_for_item(item: ServiceStatus) -> list[tuple[str | None, list[ProgramStatus]]]:
+    if item.key == "server_manager":
+        return [("서버 상태", item.programs)]
+    if item.key == "auto_coin_bot":
+        order = [
+            ("업비트", ["upbit_btc", "upbit", "upbit_stream"]),
+            ("OKX", ["okx_btc", "okx"]),
+            ("관리", ["collector", "telegram"]),
+        ]
+        by_key = {
+            program.target_key: program
+            for program in item.programs
+            if program.target_key is not None
+        }
+        sections: list[tuple[str | None, list[ProgramStatus]]] = []
+        consumed_keys: set[str] = set()
+        for title, keys in order:
+            section_programs = [by_key[key] for key in keys if key in by_key]
+            if section_programs:
+                sections.append((title, section_programs))
+                consumed_keys.update(key for key in keys if key in by_key)
+
+        extras = [
+            program
+            for program in item.programs
+            if program.target_key is None or program.target_key not in consumed_keys
+        ]
+        if extras:
+            sections.append((None, extras))
+        return sections
+
+    if item.key == "auto_stock_bot":
+        order = [
+            "collector",
+            "kr_long",
+            "kr_long_trade",
+            "kr_short",
+            "kr_short_trade",
+            "order_watch",
+            "telegram",
+            "reporter",
+            "disclosure",
+        ]
+        by_key = {
+            program.target_key: program
+            for program in item.programs
+            if program.target_key is not None
+        }
+        ordered_programs = [by_key[key] for key in order if key in by_key]
+        extras = [program for program in item.programs if program.target_key is None]
+        return [(None, [*ordered_programs, *extras])]
+
+    return [(None, item.programs)]
+
+
+def display_program_name_for_item(item: ServiceStatus, program: ProgramStatus) -> str:
+    if item.key == "auto_coin_bot":
+        labels = {
+            "upbit_btc": "비트코인",
+            "okx_btc": "비트코인",
+            "upbit": "알트",
+            "upbit_stream": "웹소켓 수집기",
+            "okx": "알트",
+            "collector": "분석 수집기",
+            "telegram": "텔레그램 명령 리스너",
+        }
+        if program.target_key in labels:
+            return labels[program.target_key]
+    if item.key == "batch_bot":
+        labels = {
+            "automation-2": "오늘의 공모주",
+            "automation-3": "금주의 공모주",
+            "daily-auto-coin-log-archive": "Coin Short Log Manager",
+            "daily-auto-stock-log-archive": "Stock Log Archive",
+            "daily-swing-log-archive": "Coin Long Log Manager",
+        }
+        if program.target_key in labels:
+            return labels[program.target_key]
+    return program.name
+
+
+def render_program_item_for_item(
+    item: ServiceStatus,
+    program: ProgramStatus,
+    *,
+    pnl_month_hidden: str,
+) -> str:
+    badge_text, badge_class = state_badge(program.state)
+    program_checked = "checked" if program.state != "stopped" else ""
+    program_state_text = "켜짐" if program.state != "stopped" else "꺼짐"
+    show_program_detail = item.key in {"batch_bot", "server_manager"}
+    program_controls = ""
+    manual_action = ""
+    if program.controllable and program.target_key:
+        label_id = f"program-state-label-{item.key}-{program.target_key}"
+        program_controls = f"""
+          <form class="program-actions" method="post" action="/apply-program">
+            <input type="hidden" name="service_key" value="{html.escape(item.key)}">
+            <input type="hidden" name="program_key" value="{html.escape(program.target_key)}">
+            {pnl_month_hidden}
+            <div class="mini-switch-wrap program-switch-wrap">
+              <span>프로그램</span>
+              <label class="switch micro-switch">
+                <input
+                  type="checkbox"
+                  class="program-toggle"
+                  name="desired_state"
+                  value="on"
+                  data-state-label="{label_id}"
+                  {program_checked}
+                >
+                <span class="slider"></span>
+              </label>
+              <span class="micro-state-text" id="{label_id}">{program_state_text}</span>
+            </div>
+            <button type="submit" class="micro-button">적용</button>
+          </form>
+        """
+    if item.key == "batch_bot" and program.manual_runnable and program.target_key:
+        manual_action = f"""
+          <form class="program-manual-form" method="post" action="/run-batch-job">
+            <input type="hidden" name="program_key" value="{html.escape(program.target_key)}">
+            {pnl_month_hidden}
+            <button type="submit" class="manual-button">수동 실행</button>
+          </form>
+        """
+
+    return f"""
+        <li class="program-row">
+          <div class="program-header">
+            <strong>{html.escape(display_program_name_for_item(item, program))}</strong>
+            <span class="badge small {badge_class}">{html.escape(badge_text)}</span>
+          </div>
+          {f'<div class="program-detail">{html.escape(program.detail)}</div>' if show_program_detail and program.detail else ''}
+          {manual_action}
+          {program_controls}
+        </li>
+    """
+
+
+def render_status_card_fragment(item: ServiceStatus, *, pnl_month: str | None = None) -> str:
+    selected_pnl_year, selected_pnl_month = parse_pnl_month(pnl_month)
+    selected_pnl_month_key = f"{selected_pnl_year:04d}-{selected_pnl_month:02d}"
+    pnl_month_hidden = f'<input type="hidden" name="pnl_month" value="{selected_pnl_month_key}">'
+
+    badge_text, badge_class = state_badge(item.state)
+    item_checked = "checked" if item.state != "stopped" else ""
+    item_state_text = "켜짐" if item.state != "stopped" else "꺼짐"
+    body_id = f"card-body-{item.key}"
+
+    section_blocks: list[str] = []
+    for index, (section_title, section_programs) in enumerate(iter_program_sections_for_item(item)):
+        programs_html = "".join(
+            render_program_item_for_item(item, program, pnl_month_hidden=pnl_month_hidden)
+            for program in section_programs
+        )
+        if section_title:
+            storage_key = f"program-group:{item.key}:{index}"
+            group_body_id = f"program-group-body-{item.key}-{index}"
+            section_blocks.append(
+                f"""
+                <section class="program-group collapsible-group" data-storage-key="{storage_key}">
+                  <div class="program-group-header">
+                    <h4>{html.escape(section_title)}</h4>
+                    <button
+                      type="button"
+                      class="ghost tool-button section-collapse-button"
+                      data-target="{group_body_id}"
+                      data-storage-key="{storage_key}"
+                    >
+                      접기
+                    </button>
+                  </div>
+                  <div class="program-group-body" id="{group_body_id}">
+                    <ul class="program-list">
+                      {programs_html or '<li class="program-empty">세부 프로그램 정보가 없습니다.</li>'}
+                    </ul>
+                  </div>
+                </section>
+                """
+            )
+        else:
+            section_blocks.append(
+                f"""
+                <section class="program-group plain-group">
+                  <ul class="program-list">
+                    {programs_html or '<li class="program-empty">세부 프로그램 정보가 없습니다.</li>'}
+                  </ul>
+                </section>
+                """
+            )
+
+    card_classes = "card wide" if len(item.programs) >= 4 else "card"
+    if item.key == "remote_manager":
+        card_classes += " wide"
+    if item.key == "auto_coin_bot":
+        card_classes += " short-card auto-coin-card"
+    if item.group == "manage":
+        card_classes += " manage-card"
+    if item.key == "remote_manager":
+        card_classes += " remote-manager-card"
+
+    tool_blocks = []
+    for tool in SERVICE_TOOLS.get(item.key, []):
+        tool_blocks.append(
+            f"""
+            <li class="tool-row">
+              <div class="tool-copy">
+                <span class="tool-label">{html.escape(tool.label)}</span>
+                <span class="tool-description">{html.escape(tool.description)}</span>
+              </div>
+              <form method="post" action="/run-tool">
+                <input type="hidden" name="service_key" value="{html.escape(item.key)}">
+                <input type="hidden" name="tool_key" value="{html.escape(tool.key)}">
+                {pnl_month_hidden}
+                <button type="submit" class="manual-button">실행</button>
+              </form>
+            </li>
+            """
+        )
+    tool_section = ""
+    if tool_blocks:
+        tool_body_id = f"tool-box-body-{item.key}"
+        tool_storage_key = f"tool-box:{item.key}"
+        tool_title = "추가 프로그램" if item.key == "auto_stock_bot" else "도구"
+        if item.key == "auto_coin_bot":
+            recent_summary_paths = list_backtest_summaries(limit=RECENT_BACKTEST_SUMMARY_LIMIT)
+            if recent_summary_paths:
+                summary_rows = []
+                for summary_path in recent_summary_paths:
+                    summary_rows.append(
+                        f"""
+                        <li class="tool-subrow">
+                          <div class="tool-copy">
+                            <span class="tool-label marquee-field" data-marquee>
+                              <span class="marquee-track">
+                                <span class="marquee-text">{html.escape(summary_path.parent.name)}</span>
+                              </span>
+                            </span>
+                            <span class="tool-description marquee-field" data-marquee>
+                              <span class="marquee-track">
+                                <span class="marquee-text">{html.escape(summary_path.relative_to(AUTO_COIN_ROOT).as_posix())}</span>
+                              </span>
+                            </span>
+                          </div>
+                          <div class="tool-link-row">
+                            <a class="ghost tool-link-button" href="{html.escape(build_backtest_summary_href(summary_path))}" target="_blank" rel="noopener">보기</a>
+                            <a class="ghost tool-link-button" href="{html.escape(build_backtest_summary_href(summary_path, download=True))}">다운로드</a>
+                          </div>
+                        </li>
+                        """
+                    )
+                tool_blocks.append(
+                    f"""
+                    <li class="tool-row tool-row-stack">
+                      <div class="tool-copy">
+                        <span class="tool-label">최근 백테스트 요약 여러 개</span>
+                        <span class="tool-description">최신 요약 {len(recent_summary_paths)}개를 바로 열거나 다운로드할 수 있습니다.</span>
+                      </div>
+                      <div class="tool-link-row">
+                        <a class="ghost tool-link-button" href="/backtest-summaries" target="_blank" rel="noopener">전체 목록</a>
+                      </div>
+                      <ul class="tool-sublist">
+                        {"".join(summary_rows)}
+                      </ul>
+                    </li>
+                    """
+                )
+        tool_section = (
+            f'<section class="tool-box collapsible-tool-box" data-storage-key="{tool_storage_key}">'
+            f'<div class="tool-box-header">'
+            f'<h4>{tool_title}</h4>'
+            f'<button type="button" class="ghost tool-button tool-collapse-button" '
+            f'data-target="{tool_body_id}" data-storage-key="{tool_storage_key}">접기</button>'
+            f'</div>'
+            f'<div class="tool-box-body" id="{tool_body_id}">'
+            f'<ul class="tool-list">{"".join(tool_blocks)}</ul>'
+            f'</div>'
+            f'</section>'
+        )
+
+    regime_section = ""
+    if item.key == "auto_coin_bot":
+        regime_entries = load_short_regime_entries()
+        if regime_entries:
+            regime_body_id = f"regime-box-body-{item.key}"
+            regime_storage_key = f"regime-box:{item.key}"
+            regime_section = (
+                f'<section class="regime-box collapsible-regime-box" data-storage-key="{regime_storage_key}">'
+                '<div class="regime-box-header">'
+                '<h4>현재 레짐</h4>'
+                '<div class="summary-actions">'
+                f'<a class="ghost tool-link-button" href="/regime-snapshot" target="_blank" rel="noopener">전체 보기</a>'
+                f'<button type="button" class="ghost tool-button regime-collapse-button" '
+                f'data-target="{regime_body_id}" data-storage-key="{regime_storage_key}">접기</button>'
+                '</div>'
+                '</div>'
+                f'<div class="regime-box-body" id="{regime_body_id}">'
+                f'{render_regime_stage_overview(regime_entries, show_coins=True, layout="flow", size="compact")}'
+                '</div>'
+                '</section>'
+            )
+
+    pnl_section = (
+        render_auto_coin_pnl_calendar(selected_pnl_year, selected_pnl_month)
+        if item.key == "auto_coin_bot"
+        else ""
+    )
+
+    if item.key == "server_manager":
+        service_actions_html = """
+            <div class="service-actions service-actions-static">
+              <div class="mini-switch-wrap static-service-label">
+                <span>현재 서버 상태</span>
+                <span class="mini-state-text always-on">로컬 서버</span>
+              </div>
+              <a class="ghost tool-link-button" href="/">새로고침</a>
+            </div>
+        """
+    else:
+        service_actions_html = f"""
+            <form class="service-actions" method="post" action="/apply-service">
+              <input type="hidden" name="service_key" value="{html.escape(item.key)}">
+              {pnl_month_hidden}
+              <div class="mini-switch-wrap">
+                <span>일괄 제어</span>
+                <label class="switch mini-switch">
+                  <input
+                    type="checkbox"
+                    class="service-toggle"
+                    name="desired_state"
+                    value="on"
+                    data-state-label="state-label-{html.escape(item.key)}"
+                    {item_checked}
+                  >
+                  <span class="slider"></span>
+                </label>
+                <span class="mini-state-text" id="state-label-{html.escape(item.key)}">{item_state_text}</span>
+              </div>
+              <button type="submit" class="mini-button">일괄 적용</button>
+            </form>
+        """
+
+    return f"""
+        <section class="{card_classes}" data-service-key="{html.escape(item.key)}" draggable="true">
+          <div class="row">
+            <div>
+              <h3>{html.escape(item.title)}</h3>
+              <p class="subtitle">{html.escape(item.subtitle)}</p>
+            </div>
+            <div class="card-header-actions">
+              <span class="badge {badge_class}">{html.escape(badge_text)}</span>
+              <button
+                type="button"
+                class="ghost tool-button collapse-button"
+                data-target="{body_id}"
+                data-card-key="{html.escape(item.key)}"
+              >
+                숨기기
+              </button>
+              <span class="drag-handle" title="카드를 드래그해서 위치를 바꿉니다.">이동</span>
+            </div>
+          </div>
+          <div class="card-body" id="{body_id}">
+            {service_actions_html}
+            <div class="service-detail">{html.escape(item.detail)}</div>
+            {pnl_section}
+            {regime_section}
+            <div class="program-sections">
+              {''.join(section_blocks) or '<div class="program-empty">세부 프로그램 정보가 없습니다.</div>'}
+            </div>
+            {tool_section}
+          </div>
+        </section>
+    """
+
+
+def get_status_for_service_key(service_key: str) -> ServiceStatus | None:
+    if service_key == "server_manager":
+        return build_server_manager_status()
+    service = find_service(service_key)
+    if service is None:
+        return None
+    return collect_service_status(service)
+
+
 def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
     statuses = get_all_statuses()
     summary_text, desired = overall_state_label(statuses)
@@ -3820,6 +4229,10 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
     .card.dragging {{
       opacity: 0.45;
       border: 1px dashed rgba(0, 113, 227, 0.4);
+    }}
+    .card.is-refreshing {{
+      opacity: 0.72;
+      transition: opacity 0.2s ease;
     }}
     .card-header-actions {{
       display: flex;
@@ -4817,6 +5230,207 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
         }}
       }});
     }});
+
+    const bindCardToggleLabels = (card) => {{
+      card.querySelectorAll('.service-toggle').forEach((serviceToggle) => {{
+        const labelId = serviceToggle.dataset.stateLabel;
+        const label = document.getElementById(labelId);
+        if (!label) {{
+          return;
+        }}
+        const refreshServiceLabel = () => {{
+          const on = serviceToggle.checked;
+          label.textContent = on ? '켜짐' : '꺼짐';
+          label.style.color = on ? '#0071e3' : '#8e8e93';
+        }};
+        serviceToggle.addEventListener('change', refreshServiceLabel);
+        refreshServiceLabel();
+      }});
+
+      card.querySelectorAll('.program-toggle').forEach((programToggle) => {{
+        const labelId = programToggle.dataset.stateLabel;
+        const label = document.getElementById(labelId);
+        if (!label) {{
+          return;
+        }}
+        const refreshProgramLabel = () => {{
+          const on = programToggle.checked;
+          label.textContent = on ? '켜짐' : '꺼짐';
+          label.style.color = on ? '#0071e3' : '#8e8e93';
+        }};
+        programToggle.addEventListener('change', refreshProgramLabel);
+        refreshProgramLabel();
+      }});
+    }};
+
+    const bindCardCollapseButtons = (card) => {{
+      const collapseButton = card.querySelector('.collapse-button');
+      if (collapseButton) {{
+        const targetId = collapseButton.dataset.target;
+        const cardKey = collapseButton.dataset.cardKey;
+        const body = document.getElementById(targetId);
+        if (body) {{
+          const applyState = () => {{
+            const collapsed = Boolean(collapsedCards[cardKey]);
+            body.classList.toggle('is-collapsed', collapsed);
+            card.classList.toggle('is-collapsed', collapsed);
+            collapseButton.textContent = collapsed ? '펼치기' : '숨기기';
+          }};
+          applyState();
+          collapseButton.addEventListener('click', () => {{
+            collapsedCards[cardKey] = !collapsedCards[cardKey];
+            writeJsonStorage(CARD_COLLAPSE_KEY, collapsedCards);
+            applyState();
+          }});
+        }}
+      }}
+
+      card.querySelectorAll('.section-collapse-button, .tool-collapse-button, .regime-collapse-button').forEach((button) => {{
+        const targetId = button.dataset.target;
+        const storageKey = button.dataset.storageKey;
+        const body = document.getElementById(targetId);
+        if (!storageKey || !body) {{
+          return;
+        }}
+        const applySectionState = () => {{
+          const collapsed = Boolean(detailsState[storageKey]);
+          body.classList.toggle('is-collapsed', collapsed);
+          button.textContent = collapsed ? '펼치기' : '접기';
+        }};
+        applySectionState();
+        button.addEventListener('click', () => {{
+          detailsState[storageKey] = !detailsState[storageKey];
+          writeJsonStorage(DETAILS_COLLAPSE_KEY, detailsState);
+          applySectionState();
+        }});
+      }});
+    }};
+
+    const bindCardDrag = (card) => {{
+      card.addEventListener('dragstart', () => {{
+        draggingCard = card;
+        card.classList.add('dragging');
+      }});
+
+      card.addEventListener('dragend', () => {{
+        if (draggingCard) {{
+          draggingCard.classList.remove('dragging');
+          const parentGrid = draggingCard.closest('.grid[data-group-key]');
+          if (parentGrid) {{
+            saveCardOrder(parentGrid);
+          }}
+        }}
+        draggingCard = null;
+      }});
+
+      card.addEventListener('dragover', (event) => {{
+        if (!draggingCard) {{
+          return;
+        }}
+        event.preventDefault();
+      }});
+
+      card.addEventListener('drop', (event) => {{
+        if (!draggingCard) {{
+          return;
+        }}
+
+        const target = event.currentTarget;
+        const currentGrid = draggingCard.closest('.grid[data-group-key]');
+        const targetGrid = target.closest('.grid[data-group-key]');
+        if (!currentGrid || !targetGrid || currentGrid !== targetGrid || target === draggingCard) {{
+          return;
+        }}
+
+        event.preventDefault();
+        const rect = target.getBoundingClientRect();
+        const placeBefore = event.clientY < rect.top + rect.height / 2;
+        targetGrid.insertBefore(draggingCard, placeBefore ? target : target.nextSibling);
+        saveCardOrder(targetGrid);
+      }});
+    }};
+
+    const hydrateCard = (card) => {{
+      if (!card) {{
+        return;
+      }}
+      bindCardToggleLabels(card);
+      bindCardCollapseButtons(card);
+      bindCardDrag(card);
+      setupMarquee();
+    }};
+
+    const cardHasDirtyInputs = (card) => {{
+      return Array.from(card.querySelectorAll('input[type="checkbox"]')).some((input) => input.checked !== input.defaultChecked);
+    }};
+
+    const inFlightCardRefreshes = new Set();
+
+    const refreshCard = async (card) => {{
+      if (!card || card.classList.contains('dragging') || cardHasDirtyInputs(card)) {{
+        return;
+      }}
+      const serviceKey = card.dataset.serviceKey;
+      if (!serviceKey || inFlightCardRefreshes.has(serviceKey)) {{
+        return;
+      }}
+
+      const params = new URLSearchParams();
+      params.set('service_key', serviceKey);
+      const currentParams = new URLSearchParams(window.location.search);
+      const pnlMonth = currentParams.get('pnl_month');
+      const accessKey = currentParams.get('key');
+      if (pnlMonth) {{
+        params.set('pnl_month', pnlMonth);
+      }}
+      if (accessKey) {{
+        params.set('key', accessKey);
+      }}
+
+      card.classList.add('is-refreshing');
+      inFlightCardRefreshes.add(serviceKey);
+      try {{
+        const response = await fetch(`/api/card?${{params.toString()}}`, {{
+          headers: {{
+            'X-Requested-With': 'fetch',
+          }},
+        }});
+        if (!response.ok) {{
+          throw new Error(`card refresh failed: ${{response.status}}`);
+        }}
+        const html = await response.text();
+        const template = document.createElement('template');
+        template.innerHTML = html.trim();
+        const nextCard = template.content.firstElementChild;
+        if (!nextCard) {{
+          throw new Error('empty card fragment');
+        }}
+        if (cardHasDirtyInputs(card)) {{
+          card.classList.remove('is-refreshing');
+          return;
+        }}
+        card.replaceWith(nextCard);
+        hydrateCard(nextCard);
+      }} catch (error) {{
+        console.error(error);
+        card.classList.remove('is-refreshing');
+      }} finally {{
+        inFlightCardRefreshes.delete(serviceKey);
+      }}
+    }};
+
+    const refreshAllCards = () => {{
+      document.querySelectorAll('.card[data-service-key]').forEach((card) => {{
+        refreshCard(card);
+      }});
+    }};
+
+    document.addEventListener('visibilitychange', () => {{
+      if (document.visibilityState === 'visible') {{
+        refreshAllCards();
+      }}
+    }});
+    window.setInterval(refreshAllCards, 30000);
   </script>
 </body>
 </html>
@@ -4908,6 +5522,36 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = render_favicon_svg()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/api/card":
+            authorized, grant_cookie = check_request_authorization(self)
+            if not authorized:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            query = parse_qs(parsed.query)
+            service_key = (query.get("service_key", [""])[0] or "").strip()
+            pnl_month = (query.get("pnl_month", [""])[0] or "").strip()
+            if not service_key:
+                self.send_error(HTTPStatus.BAD_REQUEST, "service_key 가 필요합니다.")
+                return
+
+            item = get_status_for_service_key(service_key)
+            if item is None:
+                self.send_error(HTTPStatus.NOT_FOUND, "요청한 카드가 없습니다.")
+                return
+
+            card_html = render_status_card_fragment(item, pnl_month=pnl_month)
+            body = card_html.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            if grant_cookie:
+                self.send_header(
+                    "Set-Cookie",
+                    f"{ACCESS_COOKIE_NAME}={ACCESS_KEY}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
+                )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
