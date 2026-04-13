@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.plo.remotebot.processcontrol</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/plo/Documents/remoteBot/scripts/process_control_server.py</string>
+    <string>--serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/plo/Documents/remoteBot</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/plo/Documents/remoteBot/logs/process_control_server.launchd.out</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/plo/Documents/remoteBot/logs/process_control_server.launchd.err</string>
+</dict>
+</plist>

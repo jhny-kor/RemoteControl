@@ -5,8 +5,8 @@ poll_interval_sec = 5
 offset_path = "logs/telegram_manager.offset"
 
 [imessage]
-enabled = true
-recipients = ["y2kthr@hanmail.net"]
+enabled = false
+recipients = []
 
 [manager]
 codex_bin = "/Applications/Codex.app/Contents/Resources/codex"
@@ -107,6 +107,36 @@ enabled = true
 command_key = "reload"
 
 [projects.batch_bot.codex]
+sandbox = "workspace-write"
+timeout_sec = 1200
+add_dirs = []
+skip_git_repo_check = false
+
+[projects.remote_bot]
+path = "/Users/plo/Documents/remoteBot"
+description = "remoteBot 매니저와 웹 대시보드 제어"
+
+[projects.remote_bot.managed_programs]
+remote_manager = "텔레그램 원격 제어 매니저"
+process_control_dashboard = "웹 대시보드 서버"
+process_control_launch_agent = "웹 대시보드 자동 재기동 launch agent"
+
+[projects.remote_bot.commands]
+status = "python3 scripts/remote_bot_status.py"
+dashboard_status = "zsh scripts/manage_process_control_launch_agent.sh status"
+dashboard_reload = "zsh scripts/manage_process_control_launch_agent.sh reload"
+dashboard_stop = "zsh scripts/manage_process_control_launch_agent.sh stop"
+dashboard_open = "python3 scripts/process_control_server.py --ensure-running --open-browser"
+manager_status = "python3 remote_manager.py --status"
+manager_start = "python3 remote_manager.py --daemon"
+manager_stop = "python3 remote_manager.py --stop"
+
+[projects.remote_bot.autostart]
+enabled = true
+command_key = "dashboard_reload"
+delay_sec = 1
+
+[projects.remote_bot.codex]
 sandbox = "workspace-write"
 timeout_sec = 1200
 add_dirs = []
