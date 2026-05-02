@@ -1,6 +1,6 @@
-# TelegramRemoteControl
+# RemoteControl
 
-`TelegramRemoteControl`은 텔레그램에서 여러 로컬 프로젝트를 원격 제어하기 위한 공용 매니저입니다.
+`RemoteControl`은 텔레그램에서 여러 로컬 프로젝트를 원격 제어하기 위한 공용 매니저입니다.
 
 원격에서 할 수 있는 핵심 일은 두 가지입니다.
 
