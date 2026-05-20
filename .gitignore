@@ -6,3 +6,5 @@ __pycache__/
 logs/
 !logs/.gitkeep
 
+# 로컬 에이전트 작업 디렉토리
+.omx/

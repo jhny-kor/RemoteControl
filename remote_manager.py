@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,6 +44,7 @@ class CodexSettings:
     add_dirs: list[str] = field(default_factory=list)
     model: str | None = None
     skip_git_repo_check: bool = False
+    bypass_approvals_and_sandbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,6 +204,9 @@ def load_config(config_path: Path) -> AppConfig:
                     else None
                 ),
                 skip_git_repo_check=bool(codex_raw.get("skip_git_repo_check", False)),
+                bypass_approvals_and_sandbox=bool(
+                    codex_raw.get("bypass_approvals_and_sandbox", False)
+                ),
             ),
         )
         projects[name] = project
@@ -239,7 +244,14 @@ def telegram_api_request(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         return None
 
 
@@ -421,6 +433,22 @@ def save_offset(path: Path, offset: int) -> None:
     path.write_text(str(offset), encoding="utf-8")
 
 
+def reap_child_processes() -> int:
+    """종료된 자식 프로세스를 회수해 zombie 누적을 막는다."""
+    reaped = 0
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        except OSError:
+            break
+        if pid == 0:
+            break
+        reaped += 1
+    return reaped
+
+
 def load_pid(pid_path: Path) -> int | None:
     """pid 파일에서 프로세스 id 를 읽는다."""
     if not pid_path.exists():
@@ -481,6 +509,11 @@ def format_projects(config: AppConfig) -> str:
         description = f" - {project.description}" if project.description else ""
         lines.append(f"- {project.name}{description}")
         lines.append(f"  path: {project.path}")
+        lines.append(
+            "  codex: "
+            f"sandbox={project.codex.sandbox}, "
+            f"bypass_approvals_and_sandbox={project.codex.bypass_approvals_and_sandbox}"
+        )
         if project.managed_programs:
             lines.append("  managed_programs:")
             for program_name, program_description in sorted(project.managed_programs.items()):
@@ -499,6 +532,12 @@ def build_test_text(config: AppConfig) -> str:
     """기본 설정 점검 메시지를 만든다."""
     project_count = len(config.projects)
     project_names = ", ".join(sorted(config.projects)) or "-"
+    full_access_projects = sum(
+        1
+        for project in config.projects.values()
+        if project.codex.sandbox == "danger-full-access"
+        and project.codex.bypass_approvals_and_sandbox
+    )
     bot_token_loaded = "yes" if os.getenv(config.telegram.bot_token_env, "").strip() else "no"
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return (
@@ -507,6 +546,7 @@ def build_test_text(config: AppConfig) -> str:
         f"bot_token_loaded: {bot_token_loaded}\n"
         f"allowed_chat_ids: {len(config.telegram.allowed_chat_ids)}\n"
         f"projects: {project_count}\n"
+        f"codex_full_access_projects: {full_access_projects}/{project_count}\n"
         f"project_names: {project_names}"
     )
 
@@ -888,6 +928,38 @@ def build_codex_prompt(project: ProjectConfig, instruction: str) -> str:
     )
 
 
+def build_codex_command(
+    config: AppConfig,
+    project: ProjectConfig,
+    last_message_path: Path,
+    prompt: str,
+) -> list[str]:
+    """Codex 실행 명령을 설정에서 조립한다."""
+    command = [
+        config.manager.codex_bin,
+        "exec",
+        "-C",
+        str(project.path),
+        "-s",
+        project.codex.sandbox,
+        "-o",
+        str(last_message_path),
+    ]
+
+    if project.codex.bypass_approvals_and_sandbox:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        command.append("--full-auto")
+    if project.codex.model:
+        command.extend(["-m", project.codex.model])
+    if project.codex.skip_git_repo_check:
+        command.append("--skip-git-repo-check")
+    for add_dir in project.codex.add_dirs:
+        command.extend(["--add-dir", add_dir])
+    command.append(prompt)
+    return command
+
+
 def launch_codex_job(config: AppConfig, project: ProjectConfig, instruction: str) -> JobRecord:
     """Codex 비동기 작업을 시작한다."""
     config.manager.jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -901,26 +973,7 @@ def launch_codex_job(config: AppConfig, project: ProjectConfig, instruction: str
     last_message_path = job_dir / "last_message.txt"
     metadata_path = job_dir / "job.json"
     prompt = build_codex_prompt(project, instruction)
-
-    command = [
-        config.manager.codex_bin,
-        "exec",
-        "--full-auto",
-        "-C",
-        str(project.path),
-        "-s",
-        project.codex.sandbox,
-        "-o",
-        str(last_message_path),
-    ]
-
-    if project.codex.model:
-        command.extend(["-m", project.codex.model])
-    if project.codex.skip_git_repo_check:
-        command.append("--skip-git-repo-check")
-    for add_dir in project.codex.add_dirs:
-        command.extend(["--add-dir", add_dir])
-    command.append(prompt)
+    command = build_codex_command(config, project, last_message_path, prompt)
 
     with log_path.open("w", encoding="utf-8") as stream:
         process = subprocess.Popen(
@@ -1275,6 +1328,10 @@ def run_polling(config: AppConfig) -> None:
         f"remote_manager polling started. offset={offset} allowed_chat_ids={sorted(config.telegram.allowed_chat_ids)}",
     )
     while True:
+        reaped = reap_child_processes()
+        if reaped:
+            append_manager_log(config, f"reaped child processes: {reaped}")
+
         updates, error_message = get_updates(bot_token, offset=offset, timeout=20)
         if error_message:
             append_manager_log(config, error_message)
@@ -1283,6 +1340,7 @@ def run_polling(config: AppConfig) -> None:
 
         for update in updates:
             offset = max(offset, int(update.get("update_id", 0)) + 1)
+            save_offset(config.telegram.offset_path, offset)
             chat_id, text = parse_message_text(update)
             if not chat_id or not text:
                 continue
@@ -1294,9 +1352,19 @@ def run_polling(config: AppConfig) -> None:
                 continue
 
             append_manager_log(config, f"received command chat_id={chat_id} text={text!r}")
-            response = handle_command(config, text)
-            send_message(bot_token, chat_id, response)
-            save_offset(config.telegram.offset_path, offset)
+            try:
+                response = handle_command(config, text)
+            except Exception as exc:
+                append_manager_log(
+                    config,
+                    f"command handling failed chat_id={chat_id} error={exc}\n{traceback.format_exc()[-2000:]}",
+                )
+                response = f"명령 처리 중 오류가 발생했습니다: {exc}"
+
+            try:
+                send_message(bot_token, chat_id, response)
+            except Exception as exc:
+                append_manager_log(config, f"Telegram 응답 전송 실패 chat_id={chat_id} error={exc}")
             append_manager_log(config, f"handled command chat_id={chat_id} next_offset={offset}")
 
         time.sleep(config.telegram.poll_interval_sec)

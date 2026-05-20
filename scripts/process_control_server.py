@@ -14,6 +14,7 @@ import re
 import secrets
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -22,13 +23,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from urllib import request as urlrequest
 
 APP_ROOT = Path("/Users/plo/Documents/remoteBot")
 AUTO_COIN_ROOT = Path("/Users/plo/Documents/auto_coin_bot")
 AUTO_COIN_BACKTEST_ROOT = AUTO_COIN_ROOT / "reports/backtest_batches"
 AUTO_COIN_TRADE_LOG_ROOT = AUTO_COIN_ROOT / "trade_logs"
+AUTO_COIN_PNL_SNAPSHOT_PATH = AUTO_COIN_ROOT / "reports" / "pnl_calendar" / "daily_realized_pnl.json"
+AUTO_COIN_UPBIT_MYORDER_LOG_PATH = AUTO_COIN_ROOT / "logs" / "runtime" / "upbit_ws" / "private" / "myorder.jsonl"
 AUTO_COIN_SWING_ROOT = Path("/Users/plo/Documents/auto_coin_bot_swing")
 AUTO_STOCK_ROOT = Path("/Users/plo/Documents/auto_stock_bot")
 AUTO_STOCK_SRC = AUTO_STOCK_ROOT / "src"
@@ -42,6 +45,7 @@ SERVER_LOG_PATH = APP_ROOT / "logs/process_control_server.log"
 OUT_PATH = APP_ROOT / "logs/process_control_server.out"
 ACCESS_KEY_PATH = APP_ROOT / "logs/process_control_access_key.txt"
 ACCESS_COOKIE_NAME = "remotebot_access"
+ACCESS_KEY_STORAGE_NAME = "remotebot_access_key"
 TOOL_RUN_LOG_DIR = APP_ROOT / "logs" / "tool_runs"
 REGIME_CACHE_PATH = APP_ROOT / "logs" / "current_regime_snapshot_cache.json"
 IPO_TOOL_RESULT_PATH = TOOL_RUN_LOG_DIR / "ipo_schedule_check_latest.txt"
@@ -49,6 +53,19 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 MAX_LOG_LINES = 120
 BACKTEST_SUMMARY_FILENAMES = {"batch_summary.md", "diff_summary.md"}
 RECENT_BACKTEST_SUMMARY_LIMIT = 6
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def handle_error(self, request: object, client_address: tuple[str, int]) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            append_server_log(
+                f"HTTP 연결이 클라이언트 측에서 종료됨: client={client_address[0]} error={error.__class__.__name__}"
+            )
+            return
+        super().handle_error(request, client_address)
 
 
 IPO_SCHEDULE_URL = "http://www.38.co.kr/html/fund/index.htm?o=k"
@@ -314,15 +331,17 @@ class ServiceSpec:
 SERVER_MANAGER_CACHE_TTL_SEC = 15.0
 SERVER_MANAGER_CACHE_LOCK = threading.Lock()
 SERVER_MANAGER_CACHE: tuple[float, ServiceStatus] | None = None
-SERVICE_STATUS_CACHE_TTL_SEC = 8.0
+SERVICE_STATUS_CACHE_TTL_SEC = 60.0
 SERVICE_STATUS_CACHE_LOCK = threading.Lock()
 SERVICE_STATUS_CACHE: tuple[float, list[ServiceStatus]] | None = None
+SERVICE_STATUS_REFRESH_LOCK = threading.Lock()
 MONTHLY_PNL_CACHE_TTL_SEC = 30.0
 MONTHLY_PNL_CACHE_LOCK = threading.Lock()
 MONTHLY_PNL_CACHE: dict[tuple[int, int], tuple[float, dict[int, dict[str, float]]]] = {}
 REGIME_CACHE_TTL_SEC = 60.0
 REGIME_CACHE_LOCK = threading.Lock()
 REGIME_CACHE: tuple[float, list["RegimeEntry"]] | None = None
+REGIME_REFRESH_LOCK = threading.Lock()
 
 
 REGIME_STAGE_SEQUENCE: tuple[str, ...] = (
@@ -448,9 +467,11 @@ PROGRAM_TITLES: dict[str, dict[str, str]] = {
     "batch_bot": {
         "automation-2": "오늘의 공모주",
         "automation-3": "금주의 공모주",
-        "daily-auto-coin-log-archive": "Coin Short Log Manager",
+        "daily-auto-coin-log-archive": "Coin Short Log Cleanup",
         "daily-auto-stock-log-archive": "Stock Log Archive",
-        "daily-swing-log-archive": "Coin Long Log Manager",
+        "daily-swing-log-archive": "Coin Long Log Cleanup",
+        "daily-jasoseol-alerts": "자소설 알림",
+        "daily-naver-blog-draft": "블로그 초안",
     },
 }
 
@@ -532,6 +553,10 @@ PROGRAM_TITLES.update(
         "auto_stock_bot": load_literal_dict(AUTO_STOCK_ROOT / "bot_manager.py", "SECTION_TITLES"),
     }
 )
+
+PROGRAM_SCRIPTS: dict[str, dict[str, str]] = {
+    "auto_stock_bot": load_literal_dict(AUTO_STOCK_ROOT / "bot_manager.py", "PROGRAMS"),
+}
 
 
 SERVICE_TOOLS: dict[str, list[ToolAction]] = {
@@ -679,10 +704,163 @@ def check_request_authorization(handler: BaseHTTPRequestHandler) -> tuple[bool, 
     return False, False
 
 
+def request_access_key(handler: BaseHTTPRequestHandler) -> str | None:
+    parsed = urlparse(handler.path)
+    query = parse_qs(parsed.query)
+    key = query.get("key", [""])[0]
+    return key if key == ACCESS_KEY else None
+
+
+def access_cookie_header() -> str:
+    return f"{ACCESS_COOKIE_NAME}={ACCESS_KEY}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
+
+
+def append_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    for key, value in params.items():
+        if value:
+            query[key] = [value]
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+def redact_access_key(text: str) -> str:
+    return re.sub(r"([?&]key=)[^&\s\"]+", r"\1<redacted>", text)
+
+
+def sanitize_http_log_text(text: str) -> str:
+    sanitized = "".join(
+        char if char in "\t\n\r" or 32 <= ord(char) <= 126 else "?"
+        for char in text
+    )
+    return sanitized[:500]
+
+
+def build_access_key_client_script(current_key: str | None = None) -> str:
+    current_key_json = json.dumps(current_key or "", ensure_ascii=False)
+    storage_key_json = json.dumps(ACCESS_KEY_STORAGE_NAME, ensure_ascii=False)
+    return f"""<script>
+(() => {{
+  const storageKey = {storage_key_json};
+  const currentKey = {current_key_json};
+  const readStoredKey = () => {{
+    try {{
+      return window.localStorage.getItem(storageKey) || "";
+    }} catch (error) {{
+      return "";
+    }}
+  }};
+  const writeStoredKey = (value) => {{
+    if (!value) {{
+      return;
+    }}
+    try {{
+      window.localStorage.setItem(storageKey, value);
+    }} catch (error) {{
+      // Private browsing can reject localStorage; URL/cookie auth still works.
+    }}
+  }};
+  const params = new URLSearchParams(window.location.search);
+  const urlKey = params.get("key") || "";
+  const accessKey = urlKey || currentKey || readStoredKey();
+  writeStoredKey(urlKey || currentKey);
+
+  const sameOriginUrl = (rawUrl) => {{
+    if (!rawUrl || rawUrl.startsWith("#") || /^(mailto|tel|javascript):/i.test(rawUrl)) {{
+      return null;
+    }}
+    try {{
+      const url = new URL(rawUrl, window.location.href);
+      return url.origin === window.location.origin ? url : null;
+    }} catch (error) {{
+      return null;
+    }}
+  }};
+  const withAccessKey = (rawUrl) => {{
+    if (!accessKey) {{
+      return rawUrl;
+    }}
+    const url = sameOriginUrl(rawUrl || window.location.pathname);
+    if (!url) {{
+      return rawUrl;
+    }}
+    url.searchParams.set("key", accessKey);
+    return url.pathname + url.search + url.hash;
+  }};
+
+  if (!urlKey && accessKey && document.body && document.body.dataset.accessRequired === "true") {{
+    window.location.replace(withAccessKey(window.location.pathname + window.location.search + window.location.hash));
+    return;
+  }}
+
+  const refreshAccessTargets = () => {{
+    if (!accessKey) {{
+      return;
+    }}
+    document.querySelectorAll("a[href]").forEach((link) => {{
+      const nextHref = withAccessKey(link.getAttribute("href"));
+      if (nextHref) {{
+        link.setAttribute("href", nextHref);
+      }}
+    }});
+    document.querySelectorAll("form").forEach((form) => {{
+      const rawAction = form.getAttribute("action") || window.location.pathname;
+      const nextAction = withAccessKey(rawAction);
+      if (nextAction) {{
+        form.setAttribute("action", nextAction);
+      }}
+    }});
+  }};
+
+  const originalFetch = window.fetch;
+  if (typeof originalFetch === "function") {{
+    window.fetch = (input, init) => {{
+      if (typeof input === "string") {{
+        input = withAccessKey(input);
+      }} else if (input instanceof Request) {{
+        const nextUrl = withAccessKey(input.url);
+        if (nextUrl !== input.url) {{
+          input = new Request(nextUrl, input);
+        }}
+      }}
+      return originalFetch(input, init);
+    }};
+  }}
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", refreshAccessTargets);
+  }} else {{
+    refreshAccessTargets();
+  }}
+}})();
+</script>"""
+
+
+def inject_access_key_script(body: bytes, current_key: str | None = None) -> bytes:
+    script = build_access_key_client_script(current_key).encode("utf-8")
+    marker = b"</body>"
+    if marker in body:
+        return body.replace(marker, script + b"\n</body>", 1)
+    return body + script
+
+
 def append_server_log(message: str) -> None:
-    SERVER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with SERVER_LOG_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(f"[{now_text()}] {message}\n")
+    try:
+        SERVER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SERVER_LOG_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(f"[{now_text()}] {message}\n")
+    except OSError:
+        # Logging must never break HTTP request handling.
+        return
 
 
 def read_env_file_values(env_path: Path) -> dict[str, str]:
@@ -1003,27 +1181,169 @@ def format_pnl_amount(value: float, currency: str) -> str:
     return f"{sign}{value:,.3f} {currency}"
 
 
-def load_auto_coin_monthly_pnl(year: int, month: int) -> dict[int, dict[str, float]]:
-    cache_key = (year, month)
-    now_monotonic = time.monotonic()
-    with MONTHLY_PNL_CACHE_LOCK:
-        cached = MONTHLY_PNL_CACHE.get(cache_key)
-        if cached is not None and now_monotonic - cached[0] < MONTHLY_PNL_CACHE_TTL_SEC:
-            return {day: values.copy() for day, values in cached[1].items()}
+def format_plain_amount(value: float, currency: str) -> str:
+    if currency == "KRW":
+        return f"{value:,.0f} KRW"
+    if currency == "USDT":
+        return f"{value:,.3f} USDT"
+    return f"{value:,.3f} {currency}"
 
-    if not AUTO_COIN_TRADE_LOG_ROOT.exists():
+
+def add_auto_coin_pnl_value(
+    daily_totals: dict[int, dict[str, float]],
+    date_text: str,
+    currency: str,
+    value: float,
+) -> None:
+    try:
+        day_number = int(date_text[-2:])
+    except ValueError:
+        return
+    bucket = daily_totals.setdefault(day_number, {})
+    bucket[currency] = bucket.get(currency, 0.0) + value
+
+
+def get_auto_coin_pnl_day_number(date_text: str) -> int | None:
+    try:
+        return int(date_text[-2:])
+    except ValueError:
+        return None
+
+
+def prefer_auto_coin_upbit_execution(
+    current: dict[str, object],
+    candidate: dict[str, object],
+) -> dict[str, object]:
+    state_rank = {"wait": 0, "trade": 1, "cancel": 2, "done": 3}
+    current_state = str(current.get("state") or "").lower()
+    candidate_state = str(candidate.get("state") or "").lower()
+    if state_rank.get(candidate_state, -1) != state_rank.get(current_state, -1):
+        return candidate if state_rank.get(candidate_state, -1) > state_rank.get(current_state, -1) else current
+
+    current_volume = safe_float(current.get("executed_volume")) or 0.0
+    candidate_volume = safe_float(candidate.get("executed_volume")) or 0.0
+    if candidate_volume != current_volume:
+        return candidate if candidate_volume > current_volume else current
+
+    current_time = str(current.get("captured_at_local") or "")
+    candidate_time = str(candidate.get("captured_at_local") or "")
+    return candidate if candidate_time >= current_time else current
+
+
+def load_auto_coin_upbit_sell_execution_index(year: int, month: int) -> dict[str, dict[str, object]]:
+    if not AUTO_COIN_UPBIT_MYORDER_LOG_PATH.is_file():
         return {}
 
     prefix = f"{year:04d}-{month:02d}-"
-    daily_totals: dict[int, dict[str, float]] = {}
+    latest_by_order_id: dict[str, dict[str, object]] = {}
 
-    for day_dir in sorted(AUTO_COIN_TRADE_LOG_ROOT.iterdir()):
-        if not day_dir.is_dir() or not day_dir.name.startswith(prefix):
+    try:
+        lines = AUTO_COIN_UPBIT_MYORDER_LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
             continue
-        history_path = day_dir / "trade_history.jsonl"
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        captured_at = str(record.get("captured_at_local") or "").strip()
+        if not captured_at.startswith(prefix):
+            continue
+        if str(record.get("type") or "") != "myOrder":
+            continue
+        if str(record.get("ask_bid") or "").upper() != "ASK":
+            continue
+
+        state = str(record.get("state") or "").lower()
+        if state not in {"trade", "done", "cancel"}:
+            continue
+
+        order_id = str(record.get("uuid") or "").strip()
+        if not order_id:
+            continue
+        executed_volume = safe_float(record.get("executed_volume"))
+        executed_funds = safe_float(record.get("executed_funds"))
+        if executed_volume is None or executed_volume <= 0:
+            continue
+        if executed_funds is None or executed_funds <= 0:
+            continue
+
+        previous = latest_by_order_id.get(order_id)
+        latest_by_order_id[order_id] = (
+            record if previous is None else prefer_auto_coin_upbit_execution(previous, record)
+        )
+
+    return latest_by_order_id
+
+
+def get_auto_coin_upbit_execution_fill_ratio(
+    record: dict[str, object],
+    execution: dict[str, object] | None,
+) -> float | None:
+    if execution is None:
+        return None
+
+    executed_volume = safe_float(execution.get("executed_volume"))
+    executed_funds = safe_float(execution.get("executed_funds"))
+    if (executed_volume is None or executed_volume <= 0) and (executed_funds is None or executed_funds <= 0):
+        return None
+
+    requested_amount = safe_float(record.get("requested_amount"))
+    reference_amount = requested_amount if requested_amount is not None else safe_float(record.get("amount"))
+    if executed_volume is not None and executed_volume > 0 and reference_amount and reference_amount > 0:
+        return min(1.0, max(0.0, executed_volume / reference_amount))
+
+    return 1.0
+
+
+def normalize_auto_coin_sell_pnl(
+    record: dict[str, object],
+    pnl_value: float,
+    upbit_execution: dict[str, object] | None = None,
+) -> float | None:
+    execution_fill_ratio = get_auto_coin_upbit_execution_fill_ratio(record, upbit_execution)
+    if execution_fill_ratio is not None:
+        if execution_fill_ratio <= 0:
+            return None
+        if execution_fill_ratio < 1:
+            return pnl_value * execution_fill_ratio
+        return pnl_value
+
+    fill_ratio = safe_float(record.get("fill_ratio"))
+    filled_amount = safe_float(record.get("filled_amount_reported"))
+    requested_amount = safe_float(record.get("requested_amount"))
+    reference_amount = requested_amount if requested_amount is not None else safe_float(record.get("amount"))
+    order_cost = safe_float(record.get("order_cost_reported"))
+
+    if fill_ratio is not None:
+        if fill_ratio <= 0:
+            return None
+        if fill_ratio < 1:
+            return pnl_value * fill_ratio
+        return pnl_value
+
+    if filled_amount is not None:
+        if filled_amount <= 0 and order_cost in (None, 0):
+            return None
+        if reference_amount and 0 < filled_amount < reference_amount:
+            return pnl_value * (filled_amount / reference_amount)
+
+    return pnl_value
+
+
+def load_auto_coin_logged_upbit_sell_order_ids() -> set[str]:
+    order_ids: set[str] = set()
+    if not AUTO_COIN_TRADE_LOG_ROOT.exists():
+        return order_ids
+
+    for history_path in sorted(AUTO_COIN_TRADE_LOG_ROOT.glob("*/trade_history.jsonl")):
         if not history_path.is_file():
             continue
-
         try:
             lines = history_path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -1037,26 +1357,139 @@ def load_auto_coin_monthly_pnl(year: int, month: int) -> dict[int, dict[str, flo
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
-            pnl_value = safe_float(record.get("net_realized_pnl_quote"))
-            if pnl_value is None:
-                pnl_value = safe_float(record.get("realized_pnl_quote"))
-            if pnl_value is None:
+            if str(record.get("exchange", "")).upper() != "UPBIT":
                 continue
-
-            local_time = str(record.get("recorded_at_local") or record.get("recorded_at") or "").strip()
-            date_text = local_time[:10] if len(local_time) >= 10 else day_dir.name
-            if not date_text.startswith(prefix):
+            if str(record.get("side", "")).lower() != "sell":
                 continue
+            order_id = str(record.get("exchange_order_id") or "").strip()
+            if order_id:
+                order_ids.add(order_id)
+
+    return order_ids
+
+
+def load_auto_coin_untracked_upbit_sell_executions(year: int, month: int) -> dict[int, dict[str, float]]:
+    prefix = f"{year:04d}-{month:02d}-"
+    logged_order_ids = load_auto_coin_logged_upbit_sell_order_ids()
+    latest_by_order_id = {
+        order_id: record
+        for order_id, record in load_auto_coin_upbit_sell_execution_index(year, month).items()
+        if order_id not in logged_order_ids
+    }
+
+    summaries: dict[int, dict[str, float]] = {}
+    for record in latest_by_order_id.values():
+        captured_at = str(record.get("captured_at_local") or "").strip()
+        date_text = captured_at[:10]
+        if not date_text.startswith(prefix):
+            continue
+        day_number = get_auto_coin_pnl_day_number(date_text)
+        if day_number is None:
+            continue
+        executed_funds = safe_float(record.get("executed_funds")) or 0.0
+        paid_fee = safe_float(record.get("paid_fee")) or 0.0
+        bucket = summaries.setdefault(
+            day_number,
+            {"count": 0.0, "gross_sell_value": 0.0, "paid_fee": 0.0},
+        )
+        bucket["count"] = bucket.get("count", 0.0) + 1.0
+        bucket["gross_sell_value"] = bucket.get("gross_sell_value", 0.0) + executed_funds
+        bucket["paid_fee"] = bucket.get("paid_fee", 0.0) + paid_fee
+
+    return summaries
+
+
+def load_auto_coin_monthly_pnl(year: int, month: int) -> dict[int, dict[str, float]]:
+    cache_key = (year, month)
+    now_monotonic = time.monotonic()
+    with MONTHLY_PNL_CACHE_LOCK:
+        cached = MONTHLY_PNL_CACHE.get(cache_key)
+        if cached is not None and now_monotonic - cached[0] < MONTHLY_PNL_CACHE_TTL_SEC:
+            return {day: values.copy() for day, values in cached[1].items()}
+
+    prefix = f"{year:04d}-{month:02d}-"
+    daily_totals: dict[int, dict[str, float]] = {}
+
+    if AUTO_COIN_PNL_SNAPSHOT_PATH.exists():
+        try:
+            payload = json.loads(AUTO_COIN_PNL_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            payload = {}
+        stored = payload.get("daily_totals")
+        if isinstance(stored, dict):
+            for date_text, values in stored.items():
+                if not isinstance(values, dict) or not str(date_text).startswith(prefix):
+                    continue
+                for currency, raw_value in values.items():
+                    parsed = safe_float(raw_value)
+                    if parsed is not None:
+                        add_auto_coin_pnl_value(
+                            daily_totals,
+                            str(date_text),
+                            str(currency),
+                            parsed,
+                        )
+
+    live_totals: dict[int, dict[str, float]] = {}
+    live_days: set[int] = set()
+    upbit_sell_execution_index = load_auto_coin_upbit_sell_execution_index(year, month)
+    if AUTO_COIN_TRADE_LOG_ROOT.exists():
+        for day_dir in sorted(AUTO_COIN_TRADE_LOG_ROOT.iterdir()):
+            if not day_dir.is_dir() or not day_dir.name.startswith(prefix):
+                continue
+            history_path = day_dir / "trade_history.jsonl"
+            if not history_path.is_file():
+                continue
+            day_number = get_auto_coin_pnl_day_number(day_dir.name)
+            if day_number is not None:
+                live_days.add(day_number)
 
             try:
-                day_number = int(date_text[-2:])
-            except ValueError:
+                lines = history_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
                 continue
 
-            currency = str(record.get("quote_currency") or "QUOTE").strip() or "QUOTE"
-            bucket = daily_totals.setdefault(day_number, {})
-            bucket[currency] = bucket.get(currency, 0.0) + pnl_value
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(record.get("side", "")).lower() != "sell":
+                    continue
+
+                pnl_value = safe_float(record.get("net_realized_pnl_quote"))
+                if pnl_value is None:
+                    pnl_value = safe_float(record.get("realized_pnl_quote"))
+                if pnl_value is None:
+                    continue
+                order_id = str(record.get("exchange_order_id") or "").strip()
+                upbit_execution = (
+                    upbit_sell_execution_index.get(order_id)
+                    if str(record.get("exchange", "")).upper() == "UPBIT"
+                    else None
+                )
+                pnl_value = normalize_auto_coin_sell_pnl(record, pnl_value, upbit_execution)
+                if pnl_value is None:
+                    continue
+
+                local_time = str(record.get("recorded_at_local") or record.get("recorded_at") or "").strip()
+                date_text = local_time[:10] if len(local_time) >= 10 else day_dir.name
+                if not date_text.startswith(prefix):
+                    continue
+                day_number = get_auto_coin_pnl_day_number(date_text)
+                if day_number is not None:
+                    live_days.add(day_number)
+                currency = str(record.get("quote_currency") or "QUOTE").strip() or "QUOTE"
+                add_auto_coin_pnl_value(live_totals, date_text, currency, pnl_value)
+
+    for day_number in live_days:
+        if day_number in live_totals:
+            daily_totals[day_number] = live_totals[day_number]
+        else:
+            daily_totals.pop(day_number, None)
 
     with MONTHLY_PNL_CACHE_LOCK:
         MONTHLY_PNL_CACHE[cache_key] = (
@@ -1090,6 +1523,7 @@ def parse_pnl_month(raw_value: str | None) -> tuple[int, int]:
 def render_auto_coin_pnl_calendar(year: int, month: int) -> str:
     today = datetime.now()
     daily_totals = load_auto_coin_monthly_pnl(year, month)
+    untracked_upbit_sells = load_auto_coin_untracked_upbit_sell_executions(year, month)
     month_matrix = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
     weekday_labels = ["일", "월", "화", "수", "목", "금", "토"]
     selected_month_key = f"{year:04d}-{month:02d}"
@@ -1110,10 +1544,27 @@ def render_auto_coin_pnl_calendar(year: int, month: int) -> str:
         for currency, value in day_totals.items():
             summary_totals[currency] = summary_totals.get(currency, 0.0) + value
 
-    summary_html = "".join(
+    untracked_sell_count = int(sum(day.get("count", 0.0) for day in untracked_upbit_sells.values()))
+    untracked_sell_value = sum(day.get("gross_sell_value", 0.0) for day in untracked_upbit_sells.values())
+    summary_parts = [
         f'<span class="pnl-summary-chip {"positive" if value > 0 else "negative" if value < 0 else "flat"}">{html.escape(format_pnl_amount(value, currency))}</span>'
         for currency, value in sorted(summary_totals.items())
-    ) or '<span class="pnl-summary-chip flat">이번 달 실현 손익 없음</span>'
+    ]
+    if untracked_sell_count > 0:
+        summary_parts.append(
+            f'<span class="pnl-summary-chip warning">미반영 업비트 매도 {untracked_sell_count}건</span>'
+        )
+    summary_html = "".join(summary_parts) or '<span class="pnl-summary-chip flat">이번 달 실현 손익 없음</span>'
+    untracked_note_html = (
+        f"""
+              <p class="pnl-caption pnl-warning-note">
+                업비트 private 체결 로그에는 있으나 봇 trade_history 에 없는 매도 {untracked_sell_count}건
+                ({html.escape(format_plain_amount(untracked_sell_value, "KRW"))} 매도대금)이 있어 거래소 앱 일별 손익과 차이날 수 있습니다.
+              </p>
+        """
+        if untracked_sell_count > 0
+        else ""
+    )
 
     weekday_html = "".join(f'<div class="pnl-weekday">{label}</div>' for label in weekday_labels)
 
@@ -1128,10 +1579,18 @@ def render_auto_coin_pnl_calendar(year: int, month: int) -> str:
             total_value = sum(totals.values()) if totals else 0.0
             state_class = "positive" if total_value > 0 else "negative" if total_value < 0 else "flat"
             today_class = " is-today" if (year, month, day) == (today.year, today.month, today.day) else ""
-            values_html = "".join(
+            value_parts = [
                 f'<span class="pnl-value {("positive" if value > 0 else "negative" if value < 0 else "flat")}">{html.escape(format_pnl_amount(value, currency))}</span>'
                 for currency, value in sorted(totals.items())
-            ) or '<span class="pnl-value flat">-</span>'
+            ]
+            untracked_day = untracked_upbit_sells.get(day)
+            if untracked_day:
+                count = int(untracked_day.get("count", 0.0))
+                sell_value = float(untracked_day.get("gross_sell_value", 0.0))
+                value_parts.append(
+                    f'<span class="pnl-value warning">미반영 업비트 매도 {count}건 · {html.escape(format_plain_amount(sell_value, "KRW"))}</span>'
+                )
+            values_html = "".join(value_parts) or '<span class="pnl-value flat">-</span>'
 
             day_cells.append(
                 f"""
@@ -1150,8 +1609,9 @@ def render_auto_coin_pnl_calendar(year: int, month: int) -> str:
         <section class="pnl-box collapsible-pnl-box" data-storage-key="pnl-calendar">
           <div class="pnl-box-header">
             <div>
-              <h4>월간 PnL 캘린더</h4>
-              <p class="pnl-caption">{year}년 {month}월 실현 손익 기준입니다.</p>
+              <h4>봇 실현 PnL 캘린더</h4>
+              <p class="pnl-caption">{year}년 {month}월 auto_coin_bot trade_history 매도 실현손익 기준입니다. 업비트 앱의 계좌/평가 기준 일별 손익과는 범위가 다릅니다.</p>
+              {untracked_note_html}
             </div>
             <div class="pnl-summary">
               {summary_html}
@@ -1599,15 +2059,25 @@ def tail_server_log(limit: int = 30) -> str:
 
 
 def run_command(command: CommandSpec, timeout_sec: int = 90) -> tuple[bool, str]:
-    completed = subprocess.run(
-        command.argv,
-        cwd=command.cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout_sec,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command.argv,
+            cwd=command.cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        text = strip_ansi(str(output).strip())
+        suffix = f"\n타임아웃: {timeout_sec}초" if text else f"타임아웃: {timeout_sec}초"
+        return False, f"{text}{suffix}"
+    except OSError as exc:
+        return False, str(exc)
     output = strip_ansi((completed.stdout or "").strip())
     return completed.returncode == 0, output
 
@@ -1956,6 +2426,93 @@ def build_service_detail(
     return "\n".join(detail_lines[:2]) if detail_lines else service.subtitle
 
 
+def read_managed_pid(root: Path, program_key: str) -> int | None:
+    path = root / "logs" / "pids" / f"{program_key}.pid"
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def remove_managed_pid(root: Path, program_key: str) -> None:
+    path = root / "logs" / "pids" / f"{program_key}.pid"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def build_pidfile_programs(root: Path, service_key: str) -> list[ProgramStatus]:
+    scripts = PROGRAM_SCRIPTS.get(service_key, {})
+    titles = program_title_map(service_key)
+    programs: list[ProgramStatus] = []
+
+    for program_key, script in scripts.items():
+        title = titles.get(program_key, program_key.replace("_", " ").title())
+        pid = read_managed_pid(root, program_key)
+        if pid is not None and is_pid_alive(pid):
+            programs.append(
+                ProgramStatus(
+                    name=title,
+                    state="running",
+                    detail=f"상태: 실행 중 1개  스크립트: {script}\nPID {pid} | 실행시간 ?",
+                    target_key=program_key,
+                    controllable=True,
+                )
+            )
+        else:
+            if pid is not None:
+                remove_managed_pid(root, program_key)
+            programs.append(
+                ProgramStatus(
+                    name=title,
+                    state="stopped",
+                    detail=f"상태: 중지됨  스크립트: {script}",
+                    target_key=program_key,
+                    controllable=True,
+                )
+            )
+
+    return programs
+
+
+def collect_auto_stock_status_fast(service: ServiceSpec) -> ServiceStatus:
+    programs = build_pidfile_programs(AUTO_STOCK_ROOT, service.key)
+    if not programs:
+        return ServiceStatus(
+            key=service.key,
+            group=service.group,
+            title=service.title,
+            subtitle=service.subtitle,
+            state="error",
+            detail="프로그램 정의를 읽지 못했습니다.",
+            programs=[],
+        )
+
+    running = sum(item.state == "running" for item in programs)
+    stopped = sum(item.state == "stopped" for item in programs)
+    if running == len(programs):
+        state = "running"
+    elif stopped == len(programs):
+        state = "stopped"
+    elif running > 0:
+        state = "partial"
+    else:
+        state = "error"
+
+    return ServiceStatus(
+        key=service.key,
+        group=service.group,
+        title=service.title,
+        subtitle=service.subtitle,
+        state=state,
+        detail=f"프로그램 {len(programs)}개 중 실행 {running}개, 중지 {stopped}개",
+        programs=programs,
+    )
+
+
 def run_quick_command(argv: list[str], timeout_sec: int = 4) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
@@ -2177,10 +2734,13 @@ def build_server_manager_status() -> ServiceStatus:
 
 
 def collect_service_status(service: ServiceSpec) -> ServiceStatus:
-    _, status_output = run_command(service.status_command)
+    if service.key == "auto_stock_bot":
+        return collect_auto_stock_status_fast(service)
+
+    _, status_output = run_command(service.status_command, timeout_sec=25)
     programs_output = None
     if service.programs_command is not None:
-        _, programs_output = run_command(service.programs_command)
+        _, programs_output = run_command(service.programs_command, timeout_sec=25)
     detail = build_service_detail(service, status_output, programs_output)
     return ServiceStatus(
         key=service.key,
@@ -2193,17 +2753,34 @@ def collect_service_status(service: ServiceSpec) -> ServiceStatus:
     )
 
 
-def get_all_statuses() -> list[ServiceStatus]:
-    global SERVICE_STATUS_CACHE
+def build_loading_status(service: ServiceSpec) -> ServiceStatus:
+    return ServiceStatus(
+        key=service.key,
+        group=service.group,
+        title=service.title,
+        subtitle=service.subtitle,
+        state="partial",
+        detail="상태를 갱신하는 중입니다.",
+        programs=[],
+    )
 
-    now_monotonic = time.monotonic()
-    with SERVICE_STATUS_CACHE_LOCK:
-        if (
-            SERVICE_STATUS_CACHE is not None
-            and now_monotonic - SERVICE_STATUS_CACHE[0] < SERVICE_STATUS_CACHE_TTL_SEC
-        ):
-            return list(SERVICE_STATUS_CACHE[1])
 
+def build_loading_statuses() -> list[ServiceStatus]:
+    return [
+        ServiceStatus(
+            key="server_manager",
+            group="manage",
+            title="웹 제어 서버",
+            subtitle="Process Control Center",
+            state="partial",
+            detail="상태를 갱신하는 중입니다.",
+            programs=[],
+        ),
+        *[build_loading_status(service) for service in SERVICES],
+    ]
+
+
+def collect_all_statuses_uncached() -> list[ServiceStatus]:
     workers = min(6, len(SERVICES) + 1)
     ordered_results: dict[str, ServiceStatus] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2219,11 +2796,51 @@ def get_all_statuses() -> list[ServiceStatus]:
     results = [ordered_results["server_manager"]]
     for service in SERVICES:
         results.append(ordered_results[service.key])
-
-    with SERVICE_STATUS_CACHE_LOCK:
-        SERVICE_STATUS_CACHE = (time.monotonic(), list(results))
-
     return results
+
+
+def refresh_service_status_cache(*, lock_acquired: bool = False) -> None:
+    global SERVICE_STATUS_CACHE
+    acquired = lock_acquired
+    if not acquired:
+        acquired = SERVICE_STATUS_REFRESH_LOCK.acquire(blocking=False)
+        if not acquired:
+            return
+    try:
+        results = collect_all_statuses_uncached()
+        with SERVICE_STATUS_CACHE_LOCK:
+            SERVICE_STATUS_CACHE = (time.monotonic(), list(results))
+    except Exception as exc:
+        append_server_log(f"상태 캐시 갱신 실패: {exc}")
+    finally:
+        SERVICE_STATUS_REFRESH_LOCK.release()
+
+
+def schedule_service_status_refresh() -> None:
+    if not SERVICE_STATUS_REFRESH_LOCK.acquire(blocking=False):
+        return
+    threading.Thread(
+        target=refresh_service_status_cache,
+        kwargs={"lock_acquired": True},
+        daemon=True,
+    ).start()
+
+
+def get_all_statuses() -> list[ServiceStatus]:
+    global SERVICE_STATUS_CACHE
+
+    now_monotonic = time.monotonic()
+    with SERVICE_STATUS_CACHE_LOCK:
+        cached = SERVICE_STATUS_CACHE
+        if cached is not None:
+            age = now_monotonic - cached[0]
+            if age < SERVICE_STATUS_CACHE_TTL_SEC:
+                return list(cached[1])
+            schedule_service_status_refresh()
+            return list(cached[1])
+
+    schedule_service_status_refresh()
+    return build_loading_statuses()
 
 
 def invalidate_dashboard_caches() -> None:
@@ -2345,6 +2962,71 @@ def _build_regime_entries_from_rows(rows: list[object]) -> list[RegimeEntry]:
     return entries
 
 
+def load_regime_entries_from_cache_file() -> list[RegimeEntry]:
+    if not REGIME_CACHE_PATH.exists():
+        return []
+    try:
+        payload = json.loads(REGIME_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    return _build_regime_entries_from_rows(payload.get("rows", []))
+
+
+def refresh_regime_cache(*, lock_acquired: bool = False) -> None:
+    global REGIME_CACHE
+
+    acquired = lock_acquired
+    if not acquired:
+        acquired = REGIME_REFRESH_LOCK.acquire(blocking=False)
+        if not acquired:
+            return
+    try:
+        command = CommandSpec(
+            cwd=AUTO_COIN_ROOT,
+            argv=[
+                str(AUTO_COIN_ROOT / ".venv/bin/python"),
+                "-m",
+                "reporting.current_regime_snapshot",
+                "--print-only",
+            ],
+        )
+        success, output = run_command(command, timeout_sec=8)
+        if not success:
+            append_server_log(f"단타 레짐 스냅샷 실행 실패: {output[:300]}")
+            return
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            append_server_log(f"단타 레짐 스냅샷 파싱 실패: {exc}")
+            return
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        entries = _build_regime_entries_from_rows(rows)
+        try:
+            REGIME_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            REGIME_CACHE_PATH.write_text(
+                json.dumps({"saved_at": time.time(), "rows": rows}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        with REGIME_CACHE_LOCK:
+            REGIME_CACHE = (time.monotonic(), list(entries))
+    finally:
+        REGIME_REFRESH_LOCK.release()
+
+
+def schedule_regime_cache_refresh() -> None:
+    if not REGIME_REFRESH_LOCK.acquire(blocking=False):
+        return
+    threading.Thread(
+        target=refresh_regime_cache,
+        kwargs={"lock_acquired": True},
+        daemon=True,
+    ).start()
+
+
 def load_short_regime_entries() -> list[RegimeEntry]:
     global REGIME_CACHE
 
@@ -2353,53 +3035,8 @@ def load_short_regime_entries() -> list[RegimeEntry]:
         if REGIME_CACHE is not None and now_monotonic - REGIME_CACHE[0] < REGIME_CACHE_TTL_SEC:
             return list(REGIME_CACHE[1])
 
-    if REGIME_CACHE_PATH.exists():
-        try:
-            payload = json.loads(REGIME_CACHE_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        if isinstance(payload, dict):
-            saved_at = safe_float(payload.get("saved_at"))
-            if saved_at is not None and time.time() - saved_at < REGIME_CACHE_TTL_SEC:
-                entries = _build_regime_entries_from_rows(payload.get("rows", []))
-                with REGIME_CACHE_LOCK:
-                    REGIME_CACHE = (time.monotonic(), list(entries))
-                return entries
-
-    command = CommandSpec(
-        cwd=AUTO_COIN_ROOT,
-        argv=[
-            str(AUTO_COIN_ROOT / ".venv/bin/python"),
-            "-m",
-            "reporting.current_regime_snapshot",
-            "--print-only",
-        ],
-    )
-    success, output = run_command(command)
-    if not success:
-        append_server_log(f"단타 레짐 스냅샷 실행 실패: {output[:300]}")
-        if REGIME_CACHE_PATH.exists():
-            try:
-                payload = json.loads(REGIME_CACHE_PATH.read_text(encoding="utf-8"))
-                return _build_regime_entries_from_rows(payload.get("rows", []))
-            except (OSError, json.JSONDecodeError, AttributeError):
-                return []
-        return []
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as exc:
-        append_server_log(f"단타 레짐 스냅샷 파싱 실패: {exc}")
-        return []
-    rows = payload.get("rows", []) if isinstance(payload, dict) else []
-    entries = _build_regime_entries_from_rows(rows)
-    try:
-        REGIME_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        REGIME_CACHE_PATH.write_text(
-            json.dumps({"saved_at": time.time(), "rows": rows}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    entries = load_regime_entries_from_cache_file()
+    schedule_regime_cache_refresh()
     with REGIME_CACHE_LOCK:
         REGIME_CACHE = (time.monotonic(), list(entries))
     return entries
@@ -2869,10 +3506,44 @@ def is_pid_alive(pid: int) -> bool:
     return True
 
 
+def is_port_listening() -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex((LOCAL_URL_HOST, PORT)) == 0
+
+
+def find_pid_listening_on_port() -> int | None:
+    result = subprocess.run(
+        ["lsof", f"-tiTCP:{PORT}", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if is_pid_alive(pid):
+            return pid
+    return None
+
+
 def ensure_server_running() -> int:
     pid = read_pid()
     if pid and is_pid_alive(pid):
         return pid
+
+    port_pid = find_pid_listening_on_port()
+    if port_pid is not None:
+        PID_PATH.write_text(str(port_pid), encoding="utf-8")
+        append_server_log(f"제어 서버 PID 파일 복구: port={PORT} pid={port_pid}")
+        return port_pid
 
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUT_PATH.open("a", encoding="utf-8") as out_stream:
@@ -2886,6 +3557,15 @@ def ensure_server_running() -> int:
             text=True,
         )
     PID_PATH.write_text(str(process.pid), encoding="utf-8")
+    time.sleep(0.2)
+    if process.poll() is not None:
+        port_pid = find_pid_listening_on_port()
+        if port_pid is not None:
+            PID_PATH.write_text(str(port_pid), encoding="utf-8")
+            append_server_log(
+                f"제어 서버 중복 실행 방지: 새 프로세스 종료됨 pid={process.pid}, 기존 port_pid={port_pid}"
+            )
+            return port_pid
     return process.pid
 
 
@@ -2898,6 +3578,32 @@ def stop_server() -> str:
 
     os.kill(pid, signal.SIGTERM)
     return f"제어 서버 종료 신호를 보냈습니다. pid={pid}"
+
+
+def server_status_text() -> str:
+    pid = read_pid()
+    port_pid = find_pid_listening_on_port()
+    pid_status = "없음" if pid is None else f"{pid} ({'실행 중' if is_pid_alive(pid) else '중지됨'})"
+    port_status = "열림" if port_pid is not None or is_port_listening() else "닫힘"
+    port_owner = "없음" if port_pid is None else str(port_pid)
+    if pid is not None and port_pid is not None and pid != port_pid:
+        sync_status = "PID 파일과 포트 점유 프로세스가 다름"
+    elif pid is None and port_pid is not None:
+        sync_status = "포트는 열려 있지만 PID 파일이 없음"
+    elif pid is not None and port_pid is None:
+        sync_status = "PID 파일은 있지만 포트가 닫힘"
+    elif pid is None and port_pid is None:
+        sync_status = "중지됨"
+    else:
+        sync_status = "정상"
+    return "\n".join(
+        [
+            f"제어 서버 PID 파일: {pid_status}",
+            f"포트 {PORT}: {port_status}",
+            f"포트 점유 PID: {port_owner}",
+            f"상태: {sync_status}",
+        ]
+    )
 
 
 def overall_state_label(statuses: list[ServiceStatus]) -> tuple[str, bool | None]:
@@ -2994,9 +3700,11 @@ def display_program_name_for_item(item: ServiceStatus, program: ProgramStatus) -
         labels = {
             "automation-2": "오늘의 공모주",
             "automation-3": "금주의 공모주",
-            "daily-auto-coin-log-archive": "Coin Short Log Manager",
+            "daily-auto-coin-log-archive": "Coin Short Log Cleanup",
             "daily-auto-stock-log-archive": "Stock Log Archive",
-            "daily-swing-log-archive": "Coin Long Log Manager",
+            "daily-swing-log-archive": "Coin Long Log Cleanup",
+            "daily-jasoseol-alerts": "자소설 알림",
+            "daily-naver-blog-draft": "블로그 초안",
         }
         if program.target_key in labels:
             return labels[program.target_key]
@@ -3282,7 +3990,10 @@ def render_status_card_fragment(item: ServiceStatus, *, pnl_month: str | None = 
               >
                 숨기기
               </button>
-              <span class="drag-handle" title="카드를 드래그해서 위치를 바꿉니다.">이동</span>
+              <div class="move-controls" aria-label="카드 순서 이동">
+                <button type="button" class="move-button" data-move-card="up" aria-label="위로 이동">▲</button>
+                <button type="button" class="move-button" data-move-card="down" aria-label="아래로 이동">▼</button>
+              </div>
             </div>
           </div>
           <div class="card-body" id="{body_id}">
@@ -3398,9 +4109,11 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
             labels = {
                 "automation-2": "오늘의 공모주",
                 "automation-3": "금주의 공모주",
-                "daily-auto-coin-log-archive": "Coin Short Log Manager",
+                "daily-auto-coin-log-archive": "Coin Short Log Cleanup",
                 "daily-auto-stock-log-archive": "Stock Log Archive",
-                "daily-swing-log-archive": "Coin Long Log Manager",
+                "daily-swing-log-archive": "Coin Long Log Cleanup",
+                "daily-jasoseol-alerts": "자소설 알림",
+                "daily-naver-blog-draft": "블로그 초안",
             }
             if program.target_key in labels:
                 return labels[program.target_key]
@@ -3666,7 +4379,10 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
                   >
                     숨기기
                   </button>
-                  <span class="drag-handle" title="카드를 드래그해서 위치를 바꿉니다.">이동</span>
+                  <div class="move-controls" aria-label="카드 순서 이동">
+                    <button type="button" class="move-button" data-move-card="up" aria-label="위로 이동">▲</button>
+                    <button type="button" class="move-button" data-move-card="down" aria-label="아래로 이동">▼</button>
+                  </div>
                 </div>
               </div>
               <div class="card-body" id="{body_id}">
@@ -4167,6 +4883,12 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
     .grid[data-group-key="coin"] .card.wide {{
       grid-column: auto;
     }}
+    .grid[data-group-key="manage"] {{
+      grid-template-columns: minmax(0, 1fr);
+    }}
+    .grid[data-group-key="manage"] .card {{
+      grid-column: auto;
+    }}
     .group-block {{
       margin-top: 30px;
     }}
@@ -4245,27 +4967,35 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
       flex-wrap: nowrap;
       white-space: nowrap;
     }}
-    .remote-manager-card .drag-handle {{
-      min-width: auto;
-    }}
     .tool-button {{
       padding: 9px 14px;
       font-size: 12px;
     }}
-    .drag-handle {{
+    .move-controls {{
       display: inline-flex;
       align-items: center;
-      justify-content: center;
-      min-width: 44px;
-      padding: 8px 10px;
+      gap: 4px;
+      padding: 3px;
       border-radius: 999px;
-      background: rgba(29, 29, 31, 0.06);
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-      cursor: grab;
-      user-select: none;
+      background: rgba(29, 29, 31, 0.05);
       border: 1px solid rgba(29, 29, 31, 0.08);
+    }}
+    .move-button {{
+      width: 30px;
+      height: 30px;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+      line-height: 1;
+      touch-action: manipulation;
+    }}
+    .move-button:hover {{
+      background: rgba(0, 113, 227, 0.10);
+      color: var(--blue);
     }}
     .row {{
       display: flex;
@@ -4598,6 +5328,14 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
       background: rgba(29, 29, 31, 0.06);
       color: var(--muted);
     }}
+    .pnl-summary-chip.warning,
+    .pnl-value.warning {{
+      background: rgba(176, 116, 0, 0.14);
+      color: #8a5a00;
+    }}
+    .pnl-warning-note {{
+      color: #8a5a00;
+    }}
     .pnl-summary-meta {{
       background: rgba(29, 29, 31, 0.04);
       color: var(--muted);
@@ -4871,6 +5609,9 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
     @media (min-width: 1100px) {{
       .grid {{
         grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      }}
+      .grid[data-group-key="manage"] {{
+        grid-template-columns: minmax(0, 1fr);
       }}
       .card.wide .program-list {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5167,8 +5908,38 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
       writeJsonStorage(CARD_ORDER_KEY, cardOrder);
     }};
 
+    const bindCardMoveButtons = (card) => {{
+      card.querySelectorAll('[data-move-card]').forEach((button) => {{
+        button.addEventListener('click', (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+
+          const direction = button.dataset.moveCard;
+          const currentCard = button.closest('.card[data-service-key]');
+          const grid = currentCard ? currentCard.closest('.grid[data-group-key]') : null;
+          if (!currentCard || !grid) {{
+            return;
+          }}
+
+          if (direction === 'up') {{
+            const previous = currentCard.previousElementSibling;
+            if (previous) {{
+              grid.insertBefore(currentCard, previous);
+            }}
+          }} else if (direction === 'down') {{
+            const next = currentCard.nextElementSibling;
+            if (next) {{
+              grid.insertBefore(next, currentCard);
+            }}
+          }}
+          saveCardOrder(grid);
+        }});
+      }});
+    }};
+
     let draggingCard = null;
     document.querySelectorAll('.card[data-service-key]').forEach((card) => {{
+      bindCardMoveButtons(card);
       card.addEventListener('dragstart', () => {{
         draggingCard = card;
         card.classList.add('dragging');
@@ -5356,6 +6127,7 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
       }}
       bindCardToggleLabels(card);
       bindCardCollapseButtons(card);
+      bindCardMoveButtons(card);
       bindCardDrag(card);
       setupMarquee();
     }};
@@ -5430,7 +6202,9 @@ def render_page(message: str = "", *, pnl_month: str | None = None) -> bytes:
         refreshAllCards();
       }}
     }});
-    window.setInterval(refreshAllCards, 30000);
+    window.setTimeout(refreshAllCards, 3000);
+    window.setTimeout(refreshAllCards, 9000);
+    window.setInterval(refreshAllCards, 120000);
   </script>
 </body>
 </html>
@@ -5485,10 +6259,10 @@ def render_access_required_page() -> bytes:
     }
   </style>
 </head>
-<body>
+<body data-access-required="true">
   <div class="card">
     <h1>접근 키가 필요합니다</h1>
-    <p>아이폰이나 다른 기기에서는 접근 키가 포함된 URL로 접속해야 합니다.</p>
+    <p>아이폰이나 다른 기기에서는 접근 키가 포함된 URL로 접속해야 합니다. 저장된 키가 있으면 자동으로 다시 접속합니다.</p>
   </div>
 </body>
 </html>
@@ -5518,6 +6292,7 @@ def render_favicon_svg() -> bytes:
 class ControlHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        current_key = request_access_key(self)
         if parsed.path in {"/favicon.svg", "/favicon.ico"}:
             body = render_favicon_svg()
             self.send_response(HTTPStatus.OK)
@@ -5548,10 +6323,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             if grant_cookie:
-                self.send_header(
-                    "Set-Cookie",
-                    f"{ACCESS_COOKIE_NAME}={ACCESS_KEY}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
-                )
+                self.send_header("Set-Cookie", access_cookie_header())
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -5559,11 +6331,18 @@ class ControlHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/backtest-summary", "/backtest-summary/download", "/backtest-summaries", "/regime-snapshot", "/tool-output/ipo-schedule"}:
             authorized, grant_cookie = check_request_authorization(self)
             if not authorized:
-                self.send_error(HTTPStatus.FORBIDDEN)
+                body = render_access_required_page()
+                body = inject_access_key_script(body, current_key)
+                self.send_response(HTTPStatus.FORBIDDEN)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             query = parse_qs(parsed.query)
             if parsed.path == "/regime-snapshot":
                 body = render_short_regime_page(load_short_regime_entries())
+                body = inject_access_key_script(body, current_key)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             elif parsed.path == "/tool-output/ipo-schedule":
@@ -5571,10 +6350,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                     body = render_tool_text_page("공모주 일정 점검 결과", IPO_TOOL_RESULT_PATH.read_text(encoding="utf-8"))
                 else:
                     body = render_tool_text_page("공모주 일정 점검 결과", "저장된 결과가 없습니다.")
+                body = inject_access_key_script(body, current_key)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             elif parsed.path == "/backtest-summaries":
                 body = render_backtest_summary_list_page(list_backtest_summaries())
+                body = inject_access_key_script(body, current_key)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             else:
@@ -5602,13 +6383,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                         summary_path,
                         show_completed_banner=show_completed_banner,
                     )
+                    body = inject_access_key_script(body, current_key)
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
             if grant_cookie:
-                self.send_header(
-                    "Set-Cookie",
-                    f"{ACCESS_COOKIE_NAME}={ACCESS_KEY}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
-                )
+                self.send_header("Set-Cookie", access_cookie_header())
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -5620,6 +6399,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         authorized, grant_cookie = check_request_authorization(self)
         if not authorized:
             body = render_access_required_page()
+            body = inject_access_key_script(body, current_key)
             self.send_response(HTTPStatus.FORBIDDEN)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -5634,20 +6414,19 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         pnl_month = query.get("pnl_month", [""])[0]
         body = render_page(message=message, pnl_month=pnl_month)
+        body = inject_access_key_script(body, current_key)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         if grant_cookie:
-            self.send_header(
-                "Set-Cookie",
-                f"{ACCESS_COOKIE_NAME}={ACCESS_KEY}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
-            )
+            self.send_header("Set-Cookie", access_cookie_header())
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        authorized, _ = check_request_authorization(self)
+        current_key = request_access_key(self)
+        authorized, grant_cookie = check_request_authorization(self)
         if not authorized:
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -5706,23 +6485,32 @@ class ControlHandler(BaseHTTPRequestHandler):
             location = "/"
             if pnl_month:
                 location = location + "?" + urlencode({"pnl_month": pnl_month})
+        if current_key:
+            location = append_query_params(location, {"key": current_key})
         self.send_header("Location", location)
+        if grant_cookie:
+            self.send_header("Set-Cookie", access_cookie_header())
         self.end_headers()
 
+    def end_headers(self) -> None:
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def log_message(self, format: str, *args: object) -> None:
-        append_server_log("HTTP " + (format % args))
+        append_server_log("HTTP " + sanitize_http_log_text(redact_access_key(format % args)))
 
 
 def serve() -> int:
     PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    server = ReusableThreadingHTTPServer((BIND_HOST, PORT), ControlHandler)
     PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     append_server_log(f"제어 서버 시작: bind={BIND_HOST}:{PORT}")
     threading.Thread(target=prewarm_dashboard_caches, daemon=True).start()
-    server = ThreadingHTTPServer((BIND_HOST, PORT), ControlHandler)
     try:
         server.serve_forever()
     finally:
-        if PID_PATH.exists():
+        server.server_close()
+        if PID_PATH.exists() and read_pid() == os.getpid():
             PID_PATH.unlink()
     return 0
 
@@ -5759,6 +6547,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ensure-running", action="store_true", help="서버가 없으면 시작")
     parser.add_argument("--open-browser", action="store_true", help="브라우저 열기")
     parser.add_argument("--stop-server", action="store_true", help="제어 서버 종료")
+    parser.add_argument("--status", action="store_true", help="제어 서버 상태 출력")
     parser.add_argument("--self-test", action="store_true", help="상태 점검 출력")
     return parser.parse_args()
 
@@ -5768,6 +6557,10 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
+
+    if args.status:
+        print(server_status_text())
+        return 0
 
     if args.stop_server:
         print(stop_server())

@@ -75,7 +75,7 @@ Telegram
 - 허용된 `chat_id` 에서 온 메시지만 처리합니다.
 - 임의 셸 명령은 받지 않습니다.
 - 프로젝트별로 `config/projects.toml` 에 등록된 명령만 `/run` 으로 실행합니다.
-- `/codex` 도 등록된 프로젝트 경로에서만 실행합니다.
+- `/codex` 는 등록된 프로젝트 경로에서 실행하되, 현재 운영 설정은 승인 대기 없이 전체 접근 권한으로 실행합니다.
 
 ## 빠른 시작
 
@@ -209,10 +209,11 @@ command_key = "restart"
 delay_sec = 0
 
 [projects.my_project.codex]
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 timeout_sec = 1200
 add_dirs = []
 skip_git_repo_check = false
+bypass_approvals_and_sandbox = true
 ```
 
 ## launchd 실행
@@ -331,6 +332,7 @@ tail -n 30 logs/start_managed_services.log
 - `allowed_chat_ids` 에 본인 또는 허용된 채팅방 id만 넣습니다.
 - `config/projects.toml` 에는 꼭 필요한 명령만 등록합니다.
 - `/run` 으로 임의 셸 명령을 받지 않도록 현재 구조를 유지합니다.
+- `/codex` 는 `danger-full-access` 와 `bypass_approvals_and_sandbox = true` 로 실행되므로, 허용된 chat id 와 봇 토큰을 특히 엄격하게 관리합니다.
 - Telegram 봇 토큰이 노출되면 즉시 BotFather에서 재발급합니다.
 - `codex exec` 대상 프로젝트에는 민감한 파일이 있는지 먼저 확인합니다.
 - 맥북 상태 명령과 프로젝트 제어 명령은 개인 봇 또는 제한된 채팅에서만 사용하는 것을 권장합니다.

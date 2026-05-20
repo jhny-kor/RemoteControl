@@ -40,10 +40,11 @@ command = "/Users/plo/Documents/remoteBot/scripts/start_auto_coin_bot_boot.sh"
 delay_sec = 0
 
 [projects.auto_coin_bot.codex]
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 timeout_sec = 1200
 add_dirs = []
 skip_git_repo_check = false
+bypass_approvals_and_sandbox = true
 
 [projects.auto_stock_bot]
 path = "/Users/plo/Documents/auto_stock_bot"
@@ -71,10 +72,11 @@ enabled = true
 command_key = "start_all"
 
 [projects.auto_stock_bot.codex]
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 timeout_sec = 1200
 add_dirs = []
 skip_git_repo_check = false
+bypass_approvals_and_sandbox = true
 
 [projects.batch_bot]
 path = "/Users/plo/Documents/batchBot"
@@ -83,9 +85,11 @@ description = "Codex 자동화와 로컬 jobs를 실행하는 배치 매니저"
 [projects.batch_bot.managed_programs]
 "automation-2" = "오늘 공모주 텔레그램 전송"
 "automation-3" = "주간 공모주 텔레그램 전송"
-"daily-auto-coin-log-archive" = "auto_coin_bot 로그 압축 워크플로"
+"daily-auto-coin-log-archive" = "auto_coin_bot 로그 삭제 워크플로"
 "daily-auto-stock-log-archive" = "auto_stock_bot 로그 압축 워크플로"
-"daily-swing-log-archive" = "auto_coin_bot_swing 로그 압축 워크플로"
+"daily-swing-log-archive" = "auto_coin_bot_swing 로그 삭제 워크플로"
+"daily-jasoseol-alerts" = "자소설 채용공고 텔레그램 알림"
+"daily-naver-blog-draft" = "네이버 블로그 초안 텔레그램 전송"
 
 [projects.batch_bot.program_schedules]
 "automation-2" = "매일 06:00"
@@ -93,6 +97,8 @@ description = "Codex 자동화와 로컬 jobs를 실행하는 배치 매니저"
 "daily-auto-coin-log-archive" = "매일 06:00"
 "daily-auto-stock-log-archive" = "매일 06:10"
 "daily-swing-log-archive" = "매일 06:05"
+"daily-jasoseol-alerts" = "매일 09:00"
+"daily-naver-blog-draft" = "매일 09:00"
 
 [projects.batch_bot.commands]
 status = "python3 /Users/plo/Documents/remoteBot/scripts/batch_bot_summary.py"
@@ -107,10 +113,11 @@ enabled = true
 command_key = "reload"
 
 [projects.batch_bot.codex]
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 timeout_sec = 1200
 add_dirs = []
 skip_git_repo_check = false
+bypass_approvals_and_sandbox = true
 
 [projects.remote_bot]
 path = "/Users/plo/Documents/remoteBot"
@@ -137,7 +144,8 @@ command_key = "dashboard_reload"
 delay_sec = 1
 
 [projects.remote_bot.codex]
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 timeout_sec = 1200
 add_dirs = []
 skip_git_repo_check = false
+bypass_approvals_and_sandbox = true

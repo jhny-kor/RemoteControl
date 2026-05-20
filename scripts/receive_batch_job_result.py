@@ -22,13 +22,20 @@ SUMMARY_PREFIXES = (
     "[OK]",
     "[FAIL]",
     "[SKIP]",
+    "[압축 요약]",
+    "[삭제 요약]",
     "[압축 완료]",
+    "[삭제 완료]",
     "압축 묶음 수:",
     "압축 파일 수:",
     "원본 총 크기:",
     "압축 총 크기:",
     "절감 크기:",
+    "총 원본 크기:",
+    "삭제 총 크기:",
     "정리한 빈 폴더 수:",
+    "삭제 날짜 묶음 수:",
+    "삭제 파일 수:",
 )
 
 
@@ -85,8 +92,48 @@ def extract_log_summary(log_path: Path) -> list[str]:
     except OSError:
         return []
 
+    latest_block: list[str] = []
+    collecting = False
+    for raw_line in reversed(raw_lines):
+        stripped = raw_line.strip()
+        if not stripped:
+            if collecting:
+                break
+            continue
+        latest_block.append(stripped)
+        collecting = True
+
+    latest_block.reverse()
+
+    compression_summary: list[str] = []
+    for stripped in latest_block:
+        if stripped.startswith("[압축 요약]"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("[삭제 요약]"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("총 원본 크기:"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("원본 총 크기:"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("압축 총 크기:"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("삭제 총 크기:"):
+            compression_summary.append(stripped)
+        elif stripped.startswith("절감 크기:"):
+            compression_summary.append(stripped)
+
+    if compression_summary:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for line in compression_summary:
+            if line in seen:
+                continue
+            seen.add(line)
+            deduped.append(line)
+        return [f"  {line}" for line in deduped]
+
     picked: list[str] = []
-    for line in reversed(raw_lines):
+    for line in reversed(latest_block):
         text = line.strip()
         if not text:
             continue
